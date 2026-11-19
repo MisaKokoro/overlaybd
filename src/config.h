@@ -112,6 +112,20 @@ struct CacheConfig : public ConfigUtils::Config {
     APPCFG_PARA(blockSize, uint32_t, 65536);
 };
 
+struct PoolConfig : public ConfigUtils::Config {
+    APPCFG_CLASS
+    APPCFG_PARA(enable, bool, false);
+    APPCFG_PARA(libraryPath, std::string, "libmooncake_store.so");
+    APPCFG_PARA(master, std::string, "127.0.0.1:15051");
+    APPCFG_PARA(metadataServer, std::string, "http://127.0.0.1:18080/metadata");
+    APPCFG_PARA(localHostname, std::string, "127.0.0.1");
+    APPCFG_PARA(nameSpace, std::string, "overlaybd");
+    APPCFG_PARA(blockSize, uint32_t, 262144);
+    APPCFG_PARA(timeoutMs, uint32_t, 200);
+    APPCFG_PARA(retryMs, uint32_t, 1000);
+    APPCFG_PARA(queueDepth, uint32_t, 32);
+};
+
 struct LogConfig : public ConfigUtils::Config {
     APPCFG_CLASS
 
@@ -159,6 +173,7 @@ struct GlobalConfig : public ConfigUtils::Config {
     APPCFG_PARA(auditPath, std::string, "/var/log/overlaybd-audit.log");
     APPCFG_PARA(registryFsVersion, std::string, "v2");
     APPCFG_PARA(cacheConfig, CacheConfig);
+    APPCFG_PARA(pool, PoolConfig);
     APPCFG_PARA(gzipCacheConfig, GzipCacheConfig);
     APPCFG_PARA(logConfig, LogConfig);
     APPCFG_PARA(prefetchConfig, PrefetchConfig);

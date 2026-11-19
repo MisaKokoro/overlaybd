@@ -45,6 +45,7 @@ set(ENABLE_MIMIC_VDSO off)
 
 option(BUILD_CURL_FROM_SOURCE "Compile static libcurl" off)
 option(BUILD_STREAM_CONVERTOR "Build the stream convertor" on)
+option(BUILD_MOONPOOL_TESTING "Build focused Mooncake pool tests" OFF)
 option(ORIGIN_EXT2FS "Use original libext2fs" off)
 
 find_package(photon REQUIRED)
@@ -62,9 +63,11 @@ if(BUILD_STREAM_CONVERTOR)
     endif()
 endif()
 
-if(BUILD_TESTING)
+if(BUILD_TESTING OR BUILD_MOONPOOL_TESTING)
   enable_testing()
-  include(CTest)
+  if(BUILD_TESTING)
+    include(CTest)
+  endif()
 endif()
 
 add_subdirectory(src)

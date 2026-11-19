@@ -1,4 +1,5 @@
 add_subdirectory(registryfs)
+add_subdirectory(moonpool)
 add_subdirectory(lsmt)
 add_subdirectory(zfile)
 add_subdirectory(zstd)
@@ -18,6 +19,7 @@ target_include_directories(overlaybd_lib INTERFACE
 target_link_libraries(overlaybd_lib INTERFACE
     photon_static
     registryfs_lib
+    moonpool_lib
     lsmt_lib
     zfile_lib
     zstd_lib

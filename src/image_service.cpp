@@ -37,6 +37,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
+#include "overlaybd/moonpool/pool_fs.h"
 
 const char *DEFAULT_CONFIG_PATH = "/etc/overlaybd/overlaybd.json";
 const int LOG_SIZE = 10 * 1024 * 1024;
@@ -456,6 +457,26 @@ int ImageService::init() {
                 LOG_ERROR_RETURN(0, -1, "Failed to start http server for metrics exporter");
         } else {
             global_fs.srcfs = global_fs.underlay_registryfs;
+        }
+
+        if (global_conf.pool().enable()) {
+            auto conf = global_conf.pool();
+            MoonPool::Options options;
+            options.library_path = conf.libraryPath();
+            options.master = conf.master();
+            options.metadata_server = conf.metadataServer();
+            options.local_hostname = conf.localHostname();
+            options.name_space = conf.nameSpace();
+            options.block_size = conf.blockSize();
+            options.timeout_ms = conf.timeoutMs();
+            options.retry_ms = conf.retryMs();
+            options.queue_depth = conf.queueDepth();
+            auto pool_fs = MoonPool::new_pool_fs(global_fs.srcfs, options);
+            if (!pool_fs)
+                LOG_ERRNO_RETURN(0, -1, "invalid Mooncake pool configuration");
+            global_fs.srcfs = pool_fs;
+            LOG_INFO("moonpool enabled: protocol=tcp, namespace=`, blockSize=`, timeoutMs=`",
+                     options.name_space, options.block_size, options.timeout_ms);
         }
 
         if (global_conf.enableThread() == true && cache_type == "file") {
