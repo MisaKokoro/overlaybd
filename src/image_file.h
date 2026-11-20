@@ -145,7 +145,8 @@ private:
     IFile *open_localfile(ImageConfigNS::LayerConfig &layer, std::string &opened);
     IFile *__open_ro_file(const std::string &);
     IFile *__open_ro_target_file(const std::string &);
-    IFile *__open_ro_remote(const std::string &dir, const std::string &, const uint64_t, int);
+    IFile *__open_ro_remote(const std::string &dir, const std::string &, const uint64_t, int,
+                            const std::string &pool_path = "", uint32_t zfile_block_size = 0);
     IFile *__open_ro_target_remote(const std::string &dir, const std::string &, const uint64_t, int);
 
     // size_t seek_data(off_t begin, off_t end);

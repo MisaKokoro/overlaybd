@@ -30,6 +30,7 @@
 #include "overlaybd/lsmt/file.h"
 #include "overlaybd/lsmt/index.h"
 #include "overlaybd/zfile/zfile.h"
+#include "overlaybd/moonpool/uri.h"
 #include "config.h"
 #include "image_file.h"
 #include "switch_file.h"
@@ -151,13 +152,16 @@ void get_error_msg(int eno, std::string &err_msg) {
 }
 
 IFile *ImageFile::__open_ro_remote(const std::string &dir, const std::string &digest,
-                                   const uint64_t size, int layer_index) {
+                                   const uint64_t size, int layer_index,
+                                   const std::string &pool_path, uint32_t zfile_block_size) {
     if (conf.repoBlobUrl() == "") {
         set_failed("empty repoBlobUrl");
         LOG_ERROR_RETURN(0, nullptr, "empty repoBlobUrl for remote layer");
     }
     estring url = estring().appends("/", conf.repoBlobUrl(),
                                     (conf.repoBlobUrl().back() != '/') ? "/" : "", digest);
+    if (!pool_path.empty())
+        url = "/" + pool_path;
 
     LOG_INFO("open file from remotefs: `, size: `", url, size);
     IFile *remote_file = image_service.global_fs.remote_fs->open(url.c_str(), O_RDONLY);
@@ -185,6 +189,12 @@ IFile *ImageFile::__open_ro_remote(const std::string &dir, const std::string &di
         LOG_ERRNO_RETURN(0, nullptr, "failed to open remote file as tar file `: `", url, err_msg);
     }
 
+    if (zfile_block_size &&
+        ZFile::zfile_block_size(tar_file) != static_cast<int>(zfile_block_size)) {
+        delete tar_file;
+        set_failed("moonpool block size does not match ZFile header");
+        LOG_ERROR_RETURN(EINVAL, nullptr, "moonpool block size does not match ZFile header");
+    }
     ISwitchFile *switch_file = new_switch_file(tar_file, false, url.c_str());
     if (!switch_file) {
         set_failed("failed to open switch file ", url);
@@ -284,10 +294,27 @@ IFile *ImageFile::open_localfile(ImageConfigNS::LayerConfig &layer, std::string 
 }
 int ImageFile::open_lower_layer(IFile *&file, ImageConfigNS::LayerConfig &layer, int index) {
     std::string opened;
-    file = open_localfile(layer, opened); // try to open localfile if downloaded
-    if (file == nullptr) {
-        opened = layer.digest();
-        file = __open_ro_remote(layer.dir(), layer.digest(), layer.size(), index);
+    if (MoonPool::is_pool_uri(layer.file())) {
+        auto path = MoonPool::resolve_uri(layer.file(), conf.repoBlobUrl(), layer.digest(),
+                                          layer.size(), layer.zfileBlockSize());
+        if (path.empty()) {
+            set_failed("invalid moonpool layer URI or metadata");
+            LOG_ERROR_RETURN(EINVAL, -1, "invalid moonpool layer URI or metadata: `", layer.file());
+        }
+        MoonPool::URI uri;
+        MoonPool::parse_uri(layer.file(), uri);
+        opened = layer.file();
+        file = __open_ro_remote(layer.dir(), uri.digest, layer.size(), index, path, uri.block_size);
+    } else {
+        if (layer.file().find("://") != std::string::npos) {
+            set_failed("unsupported layer file scheme");
+            LOG_ERROR_RETURN(EINVAL, -1, "unsupported layer file scheme: `", layer.file());
+        }
+        file = open_localfile(layer, opened); // try to open localfile if downloaded
+        if (file == nullptr) {
+            opened = layer.digest();
+            file = __open_ro_remote(layer.dir(), layer.digest(), layer.size(), index);
+        }
     }
     if (file == nullptr) {
         return -1;

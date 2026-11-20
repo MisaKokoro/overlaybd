@@ -32,6 +32,7 @@ struct LayerConfig : public ConfigUtils::Config {
     APPCFG_PARA(dir, std::string, "");
     APPCFG_PARA(digest, std::string, "");
     APPCFG_PARA(targetDigest, std::string, "");
+    APPCFG_PARA(zfileBlockSize, uint32_t, 0);
     APPCFG_PARA(size, uint64_t, 0);
 };
 
@@ -115,7 +116,7 @@ struct CacheConfig : public ConfigUtils::Config {
 struct PoolConfig : public ConfigUtils::Config {
     APPCFG_CLASS
     APPCFG_PARA(enable, bool, false);
-    APPCFG_PARA(libraryPath, std::string, "libmooncake_store.so");
+    APPCFG_PARA(cacheRegistry, bool, true);
     APPCFG_PARA(master, std::string, "127.0.0.1:15051");
     APPCFG_PARA(metadataServer, std::string, "http://127.0.0.1:18080/metadata");
     APPCFG_PARA(localHostname, std::string, "127.0.0.1");

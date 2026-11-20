@@ -1,6 +1,14 @@
-add_library(moonpool_lib STATIC pool_fs.cpp mooncake_backend.cpp)
+add_library(moonpool_lib STATIC pool_fs.cpp uri.cpp)
 target_include_directories(moonpool_lib PUBLIC ${PHOTON_INCLUDE_DIR})
-target_link_libraries(moonpool_lib PUBLIC photon_static OpenSSL::Crypto ${CMAKE_DL_LIBS} pthread)
+target_link_libraries(moonpool_lib PUBLIC photon_static OpenSSL::Crypto pthread)
+
+if(ENABLE_MOONCAKE)
+    find_package(MooncakeStore REQUIRED)
+    target_sources(moonpool_lib PRIVATE mooncake_backend.cpp)
+    target_link_libraries(moonpool_lib PRIVATE Mooncake::StoreC)
+else()
+    target_sources(moonpool_lib PRIVATE mooncake_disabled.cpp)
+endif()
 
 if(BUILD_MOONPOOL_TESTING)
     add_executable(moonpool_test test/pool_test.cpp)

@@ -46,6 +46,7 @@ set(ENABLE_MIMIC_VDSO off)
 option(BUILD_CURL_FROM_SOURCE "Compile static libcurl" off)
 option(BUILD_STREAM_CONVERTOR "Build the stream convertor" on)
 option(BUILD_MOONPOOL_TESTING "Build focused Mooncake pool tests" OFF)
+option(ENABLE_MOONCAKE "Link the Mooncake Store C shared library" OFF)
 option(ORIGIN_EXT2FS "Use original libext2fs" off)
 
 find_package(photon REQUIRED)

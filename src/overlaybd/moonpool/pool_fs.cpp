@@ -1,5 +1,6 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "pool_fs.h"
+#include "uri.h"
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -206,6 +207,53 @@ std::string digest_of(const std::string &path) {
     return digest;
 }
 
+// Open the registry only on an actual miss. Layer size comes from the validated
+// snapshot configuration; a warm pool must not require an origin HEAD/GET.
+class LazyOrigin final : public photon::fs::VirtualReadOnlyFile {
+    IFileSystem *fs_;
+    std::string path_;
+    uint64_t size_;
+    std::unique_ptr<IFile> file_;
+    photon::mutex mutex_;
+
+public:
+    LazyOrigin(IFileSystem *fs, const URI &uri)
+        : fs_(fs), path_("/" + uri.origin), size_(uri.size) {
+    }
+    IFileSystem *filesystem() override {
+        return fs_;
+    }
+    int close() override {
+        return 0;
+    }
+    int fstat(struct stat *st) override {
+        memset(st, 0, sizeof(*st));
+        st->st_size = size_;
+        st->st_mode = S_IFREG | 0444;
+        st->st_blksize = 4096;
+        return 0;
+    }
+    ssize_t pread(void *buf, size_t count, off_t offset) override {
+        {
+            photon::scoped_lock lock(mutex_);
+            if (!file_) {
+                std::unique_ptr<IFile> candidate(fs_->open(path_.c_str(), O_RDONLY));
+                if (!candidate)
+                    return -1;
+                struct stat st;
+                if (candidate->fstat(&st) < 0)
+                    return -1;
+                if (st.st_size < 0 || static_cast<uint64_t>(st.st_size) != size_) {
+                    errno = EIO;
+                    return -1;
+                }
+                file_ = std::move(candidate);
+            }
+        }
+        return file_->pread(buf, count, offset);
+    }
+};
+
 class PoolFile final : public photon::fs::VirtualReadOnlyFile {
     std::unique_ptr<IFile> source_;
     std::shared_ptr<AsyncStore> store_;
@@ -217,11 +265,9 @@ class PoolFile final : public photon::fs::VirtualReadOnlyFile {
 
 public:
     PoolFile(IFile *source, IFileSystem *fs, std::shared_ptr<AsyncStore> store,
-             std::shared_ptr<Stats> stats, const Options &options, const std::string &digest)
+             std::shared_ptr<Stats> stats, const Options &options, const std::string &prefix)
         : source_(source), store_(std::move(store)), stats_(std::move(stats)), options_(options),
-          prefix_(options.name_space + "/blob-v1/" + digest + "/" +
-                  std::to_string(options.block_size) + "/"),
-          fs_(fs) {
+          prefix_(prefix), fs_(fs) {
     }
 
     IFileSystem *filesystem() override {
@@ -365,7 +411,8 @@ public:
            std::shared_ptr<Stats> stats)
         : photon::fs::ForwardFS_Ownership(source, true), options_(options),
           stats_(std::move(stats)),
-          store_(std::make_shared<AsyncStore>(options, std::move(backend), stats_)) {
+          store_(options.enable ? std::make_shared<AsyncStore>(options, std::move(backend), stats_)
+                                : nullptr) {
     }
     IFile *open(const char *path, int flags) override {
         return open(path, flags, 0);
@@ -375,13 +422,31 @@ public:
             errno = EROFS;
             return nullptr;
         }
+        if (!path) {
+            errno = EINVAL;
+            return nullptr;
+        }
+        if (is_pool_uri(path)) {
+            URI uri;
+            if (!parse_uri(path, uri, true))
+                return nullptr;
+            auto source = new LazyOrigin(m_fs, uri);
+            if (!options_.enable)
+                return source;
+            auto options = options_;
+            options.block_size = uri.block_size;
+            return new PoolFile(source, this, store_, stats_, options,
+                                uri.key_prefix(options.name_space));
+        }
         auto source = m_fs->open(path, flags, mode);
         if (!source)
             return nullptr;
         auto digest = digest_of(path);
-        if (digest.empty())
+        if (digest.empty() || !options_.enable || !options_.cache_registry)
             return source;
-        return new PoolFile(source, this, store_, stats_, options_, digest);
+        auto prefix = options_.name_space + "/blob-v1/" + digest + "/" +
+                      std::to_string(options_.block_size) + "/";
+        return new PoolFile(source, this, store_, stats_, options_, prefix);
     }
 };
 } // namespace
@@ -401,6 +466,10 @@ IFileSystem *new_pool_fs(IFileSystem *source, const Options &options,
     }
     if (!backend)
         backend = new_mooncake_backend(options);
+    if (options.enable && !backend) {
+        LOG_ERROR_RETURN(ENOTSUP, nullptr,
+                         "Mooncake backend unavailable; rebuild with ENABLE_MOONCAKE=ON");
+    }
     if (!stats)
         stats = std::make_shared<Stats>();
     return new PoolFS(source, options, std::move(backend), std::move(stats));

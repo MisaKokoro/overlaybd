@@ -10,7 +10,8 @@
 namespace MoonPool {
 
 struct Options {
-    std::string library_path = "libmooncake_store.so";
+    bool enable = true;
+    bool cache_registry = true;
     std::string master = "127.0.0.1:15051";
     std::string metadata_server = "http://127.0.0.1:18080/metadata";
     std::string local_hostname = "127.0.0.1";

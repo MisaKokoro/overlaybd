@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <vector>
 #include "overlaybd/moonpool/pool_fs.h"
+#include "overlaybd/moonpool/uri.h"
 
 const char *DEFAULT_CONFIG_PATH = "/etc/overlaybd/overlaybd.json";
 const int LOG_SIZE = 10 * 1024 * 1024;
@@ -370,7 +371,16 @@ void ImageService::set_result_file(std::string &filename, std::string &data) {
               data.c_str());
 }
 
-size_t cache_fn_trans_sha256(void *, std::string_view origin, char *name, size_t namesize) {
+size_t cache_fn_trans_sha256(void *context, std::string_view origin, char *name, size_t namesize) {
+    if (MoonPool::is_pool_uri(std::string(origin))) {
+        auto service = static_cast<ImageService *>(context);
+        auto key = MoonPool::local_cache_name(std::string(origin),
+                                              service->global_conf.pool().nameSpace());
+        if (key.empty() || key.size() + 1 > namesize)
+            return 0;
+        memcpy(name, key.c_str(), key.size() + 1);
+        return key.size();
+    }
     auto target = photon::fs::Path(origin).basename();
     if (target.size()+2 > namesize) {
         // return 0, no name trans, use origin name for cache
@@ -459,10 +469,11 @@ int ImageService::init() {
             global_fs.srcfs = global_fs.underlay_registryfs;
         }
 
-        if (global_conf.pool().enable()) {
+        {
             auto conf = global_conf.pool();
             MoonPool::Options options;
-            options.library_path = conf.libraryPath();
+            options.enable = conf.enable();
+            options.cache_registry = conf.cacheRegistry();
             options.master = conf.master();
             options.metadata_server = conf.metadataServer();
             options.local_hostname = conf.localHostname();
@@ -475,8 +486,8 @@ int ImageService::init() {
             if (!pool_fs)
                 LOG_ERRNO_RETURN(0, -1, "invalid Mooncake pool configuration");
             global_fs.srcfs = pool_fs;
-            LOG_INFO("moonpool enabled: protocol=tcp, namespace=`, blockSize=`, timeoutMs=`",
-                     options.name_space, options.block_size, options.timeout_ms);
+            LOG_INFO("moonpool routing ready: enabled=`, cacheRegistry=`, namespace=`",
+                     options.enable, options.cache_registry, options.name_space);
         }
 
         if (global_conf.enableThread() == true && cache_type == "file") {
@@ -494,7 +505,7 @@ int ImageService::init() {
             // file cache will delete its src_fs automatically when destructed
             global_fs.cached_fs = FileSystem::new_full_file_cached_fs(
                 global_fs.srcfs, registry_cache_fs, refill_size, cache_size_GB, 10000000,
-                (uint64_t)1048576 * 1024, global_fs.io_alloc, 0, {nullptr, &cache_fn_trans_sha256});
+                (uint64_t)1048576 * 1024, global_fs.io_alloc, 0, {this, &cache_fn_trans_sha256});
 
         } else if (cache_type == "ocf") {
             auto namespace_dir = std::string(cache_dir + "/namespace");

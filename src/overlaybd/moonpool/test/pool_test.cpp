@@ -1,5 +1,6 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "../pool_fs.h"
+#include "../uri.h"
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -42,6 +43,8 @@ void wait_for(F done) {
 struct SourceState {
     std::vector<char> data;
     std::atomic<int> reads{0};
+    std::atomic<int> opens{0};
+    bool fail_open = false;
     bool fail = false;
     size_t short_read = SIZE_MAX;
     SourceState() : data(3 * 4096 + 137) {
@@ -92,10 +95,15 @@ public:
         : ForwardFS_Ownership(new_localfs_adaptor(), true), state_(std::move(state)) {
     }
     IFile *open(const char *, int) override {
+        state_->opens++;
+        if (state_->fail_open) {
+            errno = EIO;
+            return nullptr;
+        }
         return new SourceFile(state_);
     }
     IFile *open(const char *, int, mode_t) override {
-        return new SourceFile(state_);
+        return open("", O_RDONLY);
     }
 };
 struct FakeState {
@@ -177,9 +185,8 @@ struct Fixture {
     }
 };
 
-void basic(bool real = false, const std::string &library = "") {
+void basic(bool real = false) {
     Fixture f;
-    f.options.library_path = library;
     if (real) {
         f.options.timeout_ms = 5000;
         f.options.name_space =
@@ -272,7 +279,7 @@ void boundaries() {
     std::cout << "scatter EOF, non-blob bypass, invalid configuration: PASS\n";
 }
 
-void isolation_and_missing_library() {
+void isolation_and_truncation() {
     Fixture first;
     first.start();
     auto a = first.open();
@@ -299,13 +306,7 @@ void isolation_and_missing_library() {
     }
     first.read_all(a.get());
     CHECK(first.stats->corrupt == 4);
-    Fixture missing;
-    missing.options.library_path = "/nonexistent-overlaybd-test/libmooncake_store.so";
-    missing.start(true);
-    auto d = missing.open();
-    missing.read_all(d.get());
-    CHECK(missing.stats->errors == 4);
-    std::cout << "namespace/block-size separation, truncated objects, missing SDK fallback: PASS\n";
+    std::cout << "namespace/block-size separation and truncated objects: PASS\n";
 }
 
 struct Ticker {
@@ -356,15 +357,20 @@ void late_completion() {
 
 // The external harness changes only the backend services. Keep this filesystem,
 // worker and file alive throughout the outage to exercise client reconnection.
-void real_recovery(const std::string &library, const std::string &directory) {
+void real_recovery(const std::string &directory) {
     Fixture f;
-    f.options.library_path = library;
     f.options.timeout_ms = 200;
     f.options.name_space =
         "obd-recovery-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    f.options.cache_registry = false;
     f.start(true);
-    auto file = f.open();
+    auto digest = path_for(*f.source).substr(path_for(*f.source).rfind('/') + 1);
+    auto uri = "moonpool://v1/b/" + digest + "?bs=4096&tenant=mooncake";
+    auto path = resolve_uri(uri, "http://registry.test/v2/image/blobs", digest,
+                            f.source->data.size(), 4096);
+    auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
+    CHECK(file);
     auto signal = [&](const char *name) {
         std::ofstream out(directory + "/" + name);
         CHECK(out.good());
@@ -404,21 +410,111 @@ void real_recovery(const std::string &library, const std::string &directory) {
         << "real Mooncake outage, fallback, reconnect and warm hit without client restart: PASS\n";
 }
 
+void scheme(bool real = false) {
+    Fixture f;
+    f.options.cache_registry = false;
+    f.options.block_size = 8192; // explicit URI size overrides the legacy default
+    if (real) {
+        f.options.timeout_ms = 5000;
+        f.options.name_space =
+            "scheme-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    }
+    f.start(real);
+    auto digest = path_for(*f.source).substr(path_for(*f.source).rfind('/') + 1);
+    auto uri = "moonpool://v1/b/" + digest + "?bs=4096&tenant=team-a";
+    URI parsed;
+    CHECK(parse_uri(uri, parsed) && parsed.block_size == 4096 && !parsed.private_layer);
+    auto resolved = resolve_uri(uri, "http://registry.test/v2/image/blobs", digest,
+                                f.source->data.size(), 4096);
+    CHECK(!resolved.empty());
+    CHECK(parse_uri("/" + resolved, parsed, true));
+    CHECK(parsed.origin == "http://registry.test/v2/image/blobs/" + digest);
+    CHECK(!local_cache_name(resolved, "ns").empty());
+    CHECK(local_cache_name(resolved, "ns") != local_cache_name(resolved, "other"));
+    CHECK(!f.fs->open(uri.c_str(), O_RDONLY) && errno == EINVAL); // missing trusted open context
+    CHECK(f.source->opens == 0);
+    auto file = std::unique_ptr<IFile>(f.fs->open(resolved.c_str(), O_RDONLY));
+    CHECK(file && f.source->opens == 0);
+    f.read_all(file.get());
+    wait_for([&] { return f.stats->puts == 4; });
+    CHECK(f.source->opens == 1);
+    auto reads = f.source->reads.load();
+    file.reset();
+    f.source->fail = f.source->fail_open = true;
+    file.reset(f.fs->open(resolved.c_str(), O_RDONLY));
+    CHECK(file);
+    f.read_all(file.get());
+    CHECK(f.stats->hits == 4 && f.source->reads == reads && f.source->opens == 1);
+    for (const auto &bad : std::vector<std::string>{
+             "moonpool://v2/b/" + digest + "?bs=4096&tenant=x",
+             "moonpool://v1/b/sha256:bad?bs=4096&tenant=x", uri + "&bs=4096", uri + "&unknown=x",
+             uri + "&", uri + "#fragment", "moonpool://v1/b/" + digest + "?bs=524288&tenant=x",
+             "moonpool://v1/b/" + digest + "?bs=4097&tenant=x",
+             "moonpool://v1/b/" + digest + "?bs=999999999999999999999&tenant=x",
+             "moonpool://v1/b/" + digest + "?bs=4096&tenant=../x",
+             "moonpool://v1/b/" + digest + "?bs=4096&tenant=x%2Fy",
+             "moonpool://v1/t/a/" + digest + "?bs=4096&tenant=b"}) {
+        CHECK(!parse_uri(bad, parsed) && errno == EINVAL);
+    }
+    CHECK(resolve_uri(uri, "http://host/blobs", digest, 10, 8192).empty());
+    CHECK(resolve_uri(uri, "file:///tmp", digest, 10, 4096).empty());
+    CHECK(resolve_uri(uri, "http://user:pass@host/blobs", digest, 10, 4096).empty());
+    CHECK(resolve_uri(uri, "http://host/blobs", "sha256:bad", 10, 4096).empty());
+    CHECK(resolve_uri(uri, "http://host/blobs", digest, 0, 4096).empty());
+
+    if (!real) {
+        f.source->fail = f.source->fail_open = false;
+        auto priv = "moonpool://v1/t/team-a/" + digest + "?bs=4096&tenant=team-a";
+        auto priv_path = resolve_uri(priv, "http://registry.test/v2/image/blobs", digest,
+                                     f.source->data.size(), 4096);
+        CHECK(local_cache_name(priv_path, "ns") != local_cache_name(resolved, "ns"));
+        file.reset(f.fs->open(priv_path.c_str(), O_RDONLY));
+        f.read_all(file.get());
+        CHECK(f.stats->misses == 8); // public and private pools never alias
+        wait_for([&] { return f.stats->puts == 8; });
+        auto other = "moonpool://v1/t/team-b/" + digest + "?bs=4096&tenant=team-b";
+        auto other_path = resolve_uri(other, "http://registry.test/v2/image/blobs", digest,
+                                      f.source->data.size(), 4096);
+        file.reset(f.fs->open(other_path.c_str(), O_RDONLY));
+        f.read_all(file.get());
+        CHECK(f.stats->misses == 12);
+
+        Fixture disabled;
+        disabled.options.enable = false;
+        disabled.start(true);
+        auto direct = std::unique_ptr<IFile>(disabled.fs->open(resolved.c_str(), O_RDONLY));
+        CHECK(direct);
+        disabled.read_all(direct.get());
+        CHECK(disabled.stats->hits == 0 && disabled.stats->misses == 0 &&
+              disabled.source->reads > 0);
+        auto before = f.stats->hits.load() + f.stats->misses.load();
+        file = f.open();
+        f.read_all(file.get());
+        CHECK(f.stats->hits.load() + f.stats->misses.load() == before);
+    }
+    std::cout
+        << "moonpool URI parsing, metadata validation, lazy origin, isolation and routing: PASS\n";
+}
+
 int main(int argc, char **argv) {
     if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_DEFAULT) != 0)
         return 1;
     int result = 0;
     try {
-        if (argc == 4 && std::string(argv[1]) == "--real-recovery")
-            real_recovery(argv[2], argv[3]);
-        else if (argc == 3 && std::string(argv[1]) == "--real")
-            basic(true, argv[2]);
-        else {
+        if (argc == 3 && std::string(argv[1]) == "--real-recovery")
+            real_recovery(argv[2]);
+        else if (argc == 2 && std::string(argv[1]) == "--real") {
+            basic(true);
+            scheme(true);
+        } else if (argc == 1) {
             basic();
             failures();
             boundaries();
-            isolation_and_missing_library();
+            isolation_and_truncation();
             late_completion();
+            scheme();
+        } else {
+            throw std::runtime_error("usage: moonpool_test [--real | --real-recovery <directory>]");
         }
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n';

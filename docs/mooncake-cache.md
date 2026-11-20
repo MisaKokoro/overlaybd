@@ -10,7 +10,7 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
 
 缓存未命中、访问出错、超时、工作队列已满或缓存对象校验失败时，读取请求会通过 RegistryFS 回源。完整块回源成功后，异步写入 Mooncake。缓存写入失败不会导致镜像读取失败；源站读取失败仍会将错误返回给调用方。该功能默认关闭。
 
-当前缓存的是 ZFile 解压前的原始 blob 字节，不改变镜像 manifest，也不负责将 OCI 镜像转换为 OverlayBD 格式。镜像准备和 snapshotter 拉取仍沿用现有流程。第一版尚未实现 `moonpool://` URI scheme，通过 OverlayBD 全局配置启用缓存包装层即可，无需修改 containerd 或 snapshotter 的代码。
+当前缓存的是 ZFile 解压前的原始 blob 字节，不负责将 OCI 镜像转换为 OverlayBD 格式。已支持 `moonpool://` URI scheme：配套 snapshotter 将远端只读层写成池地址，OverlayBD 解析后交给 PoolFile。containerd 无需修改，snapshotter 需要配套的路径生成改动。旧的 Registry 透明缓存模式仍可通过 `pool.cacheRegistry` 保留。
 
 ## 配置方式
 
@@ -20,7 +20,7 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
 {
   "pool": {
     "enable": true,
-    "libraryPath": "/absolute/path/to/libmooncake_store.so",
+    "cacheRegistry": false,
     "master": "127.0.0.1:15051",
     "metadataServer": "http://127.0.0.1:18080/metadata",
     "localHostname": "127.0.0.1",
@@ -33,9 +33,11 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
 }
 ```
 
-适配层使用 TCP，不启用 UB。OverlayBD 中的 Mooncake 客户端不提供存储容量，缓存对象由独立的存储节点持有；因此，要正常回填缓存，需要先启动 Mooncake master 和存储节点。`localHostname` 必须能被后端访问，示例中的回环地址仅适用于单机测试。tcmu 进程必须能够加载 `libraryPath` 指定的库及其依赖库，例如通过 `LD_LIBRARY_PATH` 指定依赖库搜索路径。
+适配层使用 TCP，不启用 UB。OverlayBD 中的 Mooncake 客户端不提供存储容量，缓存对象由独立的存储节点持有；因此，要正常回填缓存，需要先启动 Mooncake master 和存储节点。`localHostname` 必须能被后端访问，示例中的回环地址仅适用于单机测试。tcmu 进程启动时必须能由系统动态链接器找到 `libmooncake_store.so` 及其依赖库，例如通过安装目录的加载器配置或 `LD_LIBRARY_PATH` 指定搜索路径。运行时不再使用 `pool.libraryPath`，旧配置中的该字段应删除。
 
-已验证的 C ABI 来自 `boostkit/mooncake` 仓库的 `dev-master_ub_transport` 分支，提交为 `ad3e63a3a599a902ffcc138cc60670771392da8a`，构建选项为 `WITH_STORE_C_SHARED=ON`、`USE_TCP=ON`、`USE_UB=OFF`。由于上游指定的 yalantinglibs 子模块提交不可获取，测试构建改用了 v0.5.7 对应的提交 `73dea196d23ad8fcd4914c6ef1238f390b9a1c48`。尚未验证与其他 SDK 版本的兼容性。适配层通过动态加载调用 C ABI，OverlayBD 编译时不包含 Mooncake C++ 头文件，也不要求安装 Mooncake SDK。运行时缺少库或必要符号时，读取请求会回源。
+已验证的 C ABI 来自 `boostkit/mooncake` 仓库的 `dev-master_ub_transport` 分支，提交为 `ad3e63a3a599a902ffcc138cc60670771392da8a`，构建选项为 `WITH_STORE_C_SHARED=ON`、`USE_TCP=ON`、`USE_UB=OFF`。由于上游指定的 yalantinglibs 子模块提交不可获取，测试构建改用了 v0.5.7 对应的提交 `73dea196d23ad8fcd4914c6ef1238f390b9a1c48`。尚未验证与其他 SDK 版本的兼容性。适配层包含官方 `store_c.h`，使用其中声明的 `mooncake_store_t` 和函数，并在构建时直接链接现有 C 接口共享库。没有手写接口声明、函数指针表或 `dlopen/dlsym`。启用 Mooncake 的构建需要匹配的头文件和共享库；无需改动或重新编译当前 Mooncake 库，也不引入 Mooncake C++ 头文件或升级 OverlayBD 的 C++ 标准。
+
+直接链接后，共享库是进程启动依赖：缺库或 ABI 不匹配属于部署错误，不能当作缓存未命中处理，即使 `pool.enable=false` 也需要动态库。Mooncake 服务不可达、超时或读写失败仍按原有逻辑回源。
 
 配置约束如下：
 
@@ -51,7 +53,9 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
 
 ## 缓存数据与执行机制
 
-仅缓存以 `/sha256:<64 位小写十六进制摘要>` 结尾的路径，其他文件直接访问下层文件系统。缓存键格式为：
+显式 URI 的键格式为 `<nameSpace>/v1/b/<digest>/<bs>/<blockIndex>`（公共层）或 `<nameSpace>/v1/t/<tenant>/<digest>/<bs>/<blockIndex>`（私有层）。公共层按摘要共享，私有层按租户隔离；这不代表已实现服务端的租户认证或配额。节点本地文件缓存使用包含命名空间、完整 URI 身份、大小和回源地址的 SHA256 文件名，避免不同租户、版本与旧缓存混用。
+
+兼容透明缓存模式仅缓存以 `/sha256:<64 位小写十六进制摘要>` 结尾的路径，保留第一版键格式：
 
 ```text
 <nameSpace>/blob-v1/sha256:<digest>/<blockSize>/<blockIndex>
@@ -63,25 +67,33 @@ SDK 及其注册的临时缓冲区由一个原生工作线程持有。Photon 读
 
 ## 编译与测试
 
-准备仓库正常构建所需的依赖，并在 CMake 配置中增加 `-DBUILD_MOONPOOL_TESTING=ON`，随后执行：
+准备仓库正常构建依赖和 Mooncake C SDK，然后配置并构建：
 
 ```sh
+cmake -S . -B <build-dir> \
+  -DENABLE_MOONCAKE=ON -DBUILD_MOONPOOL_TESTING=ON \
+  -DMOONCAKE_STORE_INCLUDE_DIR=/path/to/mooncake/mooncake-store/include \
+  -DMOONCAKE_STORE_LIBRARY=/path/to/libmooncake_store.so
 cmake --build <build-dir> --target overlaybd-tcmu moonpool_test
 ctest --test-dir <build-dir> -R '^moonpool_test$' --output-on-failure
-./build/output/moonpool_test --real /absolute/path/to/libmooncake_store.so
+./build/output/moonpool_test --real
 ```
 
-默认测试使用注入的模拟后端，覆盖跨块读取、分散读取、文件末尾、短读、校验失败、缺少动态库、源站错误、命名空间隔离、队列满、Photon 调度进展，以及对象销毁后异步操作才完成的情况。
+`MOONCAKE_STORE_INCLUDE_DIR` 应指向包含 `store_c.h` 的目录。也可用 `MOONCAKE_STORE_ROOT` 指定 SDK 安装前缀，让 CMake 查找头文件和共享库。显式指定静态库会被拒绝。构建机与运行机器都需提供共享库的依赖；部署时不要依赖开发目录的构建 RPATH。
+
+`ENABLE_MOONCAKE` 默认关闭，以保留不安装 SDK 的构建方式。关闭时不会链接 Mooncake；URI 解析仍可用于直接回源，但运行时启用 `pool.enable` 会明确报错，要求重新构建。`pool.enable` 是运行时开关，不能替代构建选项。
+
+默认测试使用注入的模拟后端，覆盖跨块读取、分散读取、文件末尾、短读、校验失败、源站错误、命名空间隔离、队列满、Photon 调度进展，以及对象销毁后异步操作才完成的情况。
 
 `--real` 测试需要前述回环地址上的 Mooncake 服务。测试先回填缓存，再让测试源站读取强制失败，以确认后续读取确实命中 Mooncake。测试使用独立命名空间，产生的少量缓存对象会保留到被淘汰或存储服务重启。
 
 外部测试脚本还可以调用：
 
 ```sh
-moonpool_test --real-recovery <library> <existing-marker-directory>
+moonpool_test --real-recovery <existing-marker-directory>
 ```
 
-其中 `<library>` 是动态库路径，`<existing-marker-directory>` 是已创建的标记文件目录。测试协调流程为：
+其中 `<existing-marker-directory>` 是已创建的标记文件目录。测试协调流程为：
 
 1. 等待测试生成 `ready` 文件，然后停止 Mooncake，并创建 `down` 文件。
 2. 等待测试生成 `fallback` 文件，然后重启 Mooncake，并创建 `up` 文件。
@@ -99,8 +111,67 @@ moonpool_test --real-recovery <library> <existing-marker-directory>
 
 ## 当前限制
 
-- RegistryFS 仍需要打开源站 blob，并执行鉴权、重定向和长度探测。部分探测使用普通 GET，请求关闭前可能已经传输了响应体。因此，即使所有热缓存块读取都命中 Mooncake，仍可能存在 Registry 流量，目前不能脱离 Registry 离线运行。
+- 显式 URI 使用层配置中的已知大小，延迟到未命中时才打开 RegistryFile；完整热缓存的层数据读取无需源站请求。兼容透明模式仍有打开时的鉴权、重定向和长度探测流量。镜像 manifest/config 拉取仍可能访问 Registry，因此这不等于完整离线运行能力。
 - 缓存回填采用尽力而为的方式，尚未实现跨节点合并同一块回源请求、租约、预取、批量优化、RDMA、容量管理策略或生产级指标接口。调试日志包含 `moonpool hit` 和 `moonpool fallback`，内部计数器可供测试使用。
 - 单个工作线程限制了 SDK 并发度，大块读取可能逐块等待缓存查询。性能优化和多机测试尚未开展。
 - 对已存在的损坏对象，只绕过缓存回源，不主动删除或覆盖共享的不可变键。这类对象在被淘汰或切换命名空间前，可能持续触发回源。
 - 首轮验证在单台 ARM64 机器上完成，使用 containerd 1.7.36、OverlayBD 1.0.18 源码和 overlaybd-snapshotter 1.4.5。目前验证的是基础功能，不代表已达到生产可用性或吞吐性能目标。
+
+## `moonpool://` 层路径契约
+
+公共层和私有层分别使用以下格式：
+
+```text
+moonpool://v1/b/sha256:<摘要>?bs=4096&tenant=mooncake
+moonpool://v1/t/team-a/sha256:<摘要>?bs=4096&tenant=team-a
+```
+
+`<摘要>` 必须替换为真实的 64 位小写十六进制摘要。路径描述整个 blob，块编号由读取偏移计算。解析器拒绝未知版本、无效摘要、重复或未知参数、缺失参数、非法租户，以及私有层路径与参数中的租户不一致。租户字符约束与命名空间相同，且不能单独为 `.` 或 `..`。
+
+**当前 OverlayBD 1.0.18 的 ZFile 最大块大小是 65536 字节。** URI 中 `bs` 必须为 4096～65536 之间的 4096 整数倍，不能照搬设计文档中 524288 的示例。全局 `pool.blockSize` 是兼容透明模式的原始字节块大小；显式 URI 使用各层的 `bs`。
+
+snapshotter 配置示例：
+
+```json
+{
+  "poolEnable": true,
+  "poolFsVersion": "v1",
+  "poolTenant": "mooncake",
+  "poolPrivate": false
+}
+```
+
+原有数字型 `tenant` 用于 snapshotter 设备隔离，与新增的 `poolTenant` 不同。`poolPrivate=true` 生成私有层地址，否则生成公共层地址。只对原生 OverlayBD 远端只读层生成 URI，本地层、可写层和 turboOCI 保持原有路径。
+
+生成 URI 需要有效的 blob 摘要、正数 blob 大小，以及该层的 `containerd.io/snapshot/overlaybd/zfile-config` 注解，例如 `{"algorithm":"lz4","blockSize":4096}`。缺少注解、算法或块大小不支持时返回错误，不猜测块大小。旧镜像需要按真实 ZFile 元数据补齐注解，或关闭 `poolEnable`。开关控制新生成的快照，已有快照不会自动改写。
+
+层配置保留原摘要、大小和下载目录，同时新增 `file` 和 `zfileBlockSize`：
+
+```json
+{
+  "repoBlobUrl": "https://registry.example/v2/example/image/blobs",
+  "lowers": [{
+    "file": "moonpool://v1/b/sha256:<摘要>?bs=4096&tenant=mooncake",
+    "digest": "sha256:<摘要>",
+    "size": 123456789,
+    "zfileBlockSize": 4096,
+    "dir": "/var/lib/overlaybd/snapshots/123/fs"
+  }]
+}
+```
+
+OverlayBD 在访问缓存前校验 URI 与层元数据一致，读取层头部后还会校验 `bs` 与真实 ZFile 头部一致。失败时拒绝打开该层，不静默切换到另一种解释。回源地址由 `repoBlobUrl` 和摘要构造，复用 RegistryFS 的认证、证书与请求逻辑。URI 不携带凭据或任意回源地址；内部编码的回源上下文不是对外参数，在层 URI 中自行附加会被拒绝。
+
+OverlayBD 的 `pool.cacheRegistry` 默认是 `true`，兼容第一版透明缓存。按 scheme 接入建议设为 `false`，此时只有池地址走 Mooncake，普通远端层保持原有读取方式。`pool.enable=false` 仍能解析池地址，但直接回源，不创建 SDK 客户端；已链接的动态库仍是进程启动依赖。
+
+开发机器上的 `scripts/start-overlaybd-scheme.sh` 启动配套二进制，`scripts/test-overlaybd-scheme.sh` 验证 snapshotter 自动生成的 URI、旧路径兼容、关闭缓存、冷读、热读和故障恢复。每阶段使用全新的本地缓存和快照。测试镜像的注解由 `scripts/prepare-scheme-fixture.py` 从实际 ZFile 头部提取后写入独立的 `obd-baseline:scheme` 标签，不修改原 `native` 标签。
+
+`moonpool_test` 另覆盖 URI 错误参数、元数据不一致、公共/私有层与租户隔离，以及新文件对象命中缓存时不打开源站。snapshotter 配套单元测试命令是 `go test ./pkg/snapshot -run TestMoonpoolLayer -count=1`。
+
+实际容器测试结果保存在 `results/overlaybd-scheme-e2e.json`：旧路径、关闭缓存、冷缓存、热缓存、后端不可用、恢复回填和恢复后热读均通过。两次热读各有 3234 次池命中、0 次回源、0 次 Registry blob 请求，所有阶段的文件 SHA256 一致。
+
+`scripts/test-overlaybd-scheme-invalid.sh` 将注解块大小故意写成 8192，真实头部为 4096；容器启动被明确拒绝，结果见 `results/overlaybd-scheme-invalid.json`。`scripts/test-overlaybd-scheme-recovery.sh` 保持同一池 URI、文件对象与工作线程存活，验证后端重启后重连、回填，并在源站读取强制失败时再次命中，结果见 `results/overlaybd-scheme-recovery.json`。
+
+## C 接口直接链接验证
+
+适配层已改为官方 C 头文件加构建时动态链接。CMake 会拒绝缺失头文件、缺失库和误传静态库的配置；未启用 `ENABLE_MOONCAKE` 时不产生 Mooncake 动态库依赖，运行时启用池会明确报错。原先的“缺少 SDK 时静默回源”测试已移除，服务故障回源测试继续保留。测试程序的 `--real` 和 `--real-recovery` 参数不再接收库路径。

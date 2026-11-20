@@ -38,4 +38,6 @@ extern "C" photon::fs::IFile *new_zfile_builder(photon::fs::IFile *file,
 // return 0 if file object is a normal file.
 // otherwise return -1.
 extern "C" int is_zfile(photon::fs::IFile *file);
+// Return the verified compression block size, or -1 for invalid/non-ZFile data.
+extern "C" int zfile_block_size(photon::fs::IFile *file);
 } // namespace ZFile

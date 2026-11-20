@@ -1381,6 +1381,25 @@ int zfile_validation_check(IFile *src) {
     return 0;
 }
 
+int zfile_block_size(IFile *file) {
+    if (!file) {
+        errno = EINVAL;
+        return -1;
+    }
+    alignas(CompressionFile::HeaderTrailer) char buf[CompressionFile::HeaderTrailer::SPACE];
+    if (file->pread(buf, sizeof(buf), 0) != sizeof(buf)) {
+        errno = EIO;
+        return -1;
+    }
+    auto ht = reinterpret_cast<CompressionFile::HeaderTrailer *>(buf);
+    if (!ht->verify_magic() || !ht->is_header() || !ht->is_valid() || ht->opt.block_size < 4096 ||
+        ht->opt.block_size > MAX_READ_SIZE || ht->opt.block_size % 4096) {
+        errno = EINVAL;
+        return -1;
+    }
+    return ht->opt.block_size;
+}
+
 int is_zfile(IFile *file) {
     if (!file) {
         LOG_ERROR_RETURN(0, -1, "file is nullptr.");
