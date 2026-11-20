@@ -121,6 +121,9 @@ struct PoolConfig : public ConfigUtils::Config {
     APPCFG_PARA(metadataServer, std::string, "http://127.0.0.1:18080/metadata");
     APPCFG_PARA(localHostname, std::string, "127.0.0.1");
     APPCFG_PARA(nameSpace, std::string, "overlaybd");
+    APPCFG_PARA(protocol, std::string, "tcp");
+    APPCFG_PARA(batchBlocks, uint32_t, 16);
+    APPCFG_PARA(fallback, std::string, "direct");
     APPCFG_PARA(blockSize, uint32_t, 262144);
     APPCFG_PARA(timeoutMs, uint32_t, 200);
     APPCFG_PARA(retryMs, uint32_t, 1000);

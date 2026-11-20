@@ -43,9 +43,8 @@ void yield() {
 struct Job {
     bool write = false;
     std::string key;
-    size_t capacity = 0;
     std::vector<char> data;
-    Result result = Result::Error;
+    std::vector<ReadRequest> reads;
     std::atomic<bool> done{false};
     std::atomic<bool> abandoned{false};
 };
@@ -93,9 +92,13 @@ class AsyncStore {
                         state->retry_after = milliseconds() + state->options.retry_ms;
                     }
                 } else {
-                    job->result = state->backend->get(job->key, job->capacity, job->data);
-                    if (job->result == Result::Error)
-                        state->retry_after = milliseconds() + state->options.retry_ms;
+                    state->stats->batches++;
+                    state->stats->batch_blocks += job->reads.size();
+                    LOG_DEBUG("moonpool batch blocks=`", job->reads.size());
+                    state->backend->get_batch(job->reads);
+                    for (const auto &read : job->reads)
+                        if (read.result == Result::Error)
+                            state->retry_after = milliseconds() + state->options.retry_ms;
                 }
             } catch (...) {
                 if (job->write)
@@ -138,24 +141,22 @@ public:
         state_->wake.notify_one();
     }
 
-    Result get(const std::string &key, size_t capacity, std::vector<char> &data) {
+    void get_batch(std::vector<ReadRequest> &requests) {
         auto job = std::make_shared<Job>();
-        job->key = key;
-        job->capacity = capacity;
+        job->reads = requests;
         if (!submit(job))
-            return Result::Error;
+            return;
         auto deadline = Clock::now() + std::chrono::milliseconds(state_->options.timeout_ms);
         while (!job->done.load(std::memory_order_acquire)) {
             if (Clock::now() >= deadline) {
                 job->abandoned = true;
                 state_->retry_after = milliseconds() + state_->options.retry_ms;
                 state_->stats->timeouts++;
-                return Result::Error;
+                return;
             }
             yield();
         }
-        data = std::move(job->data);
-        return job->result;
+        requests = std::move(job->reads);
     }
 
     void put(const std::string &key, std::vector<char> data) {
@@ -323,50 +324,70 @@ public:
         count = std::min<uint64_t>(count, size - offset);
         size_t copied = 0;
         while (copied < count) {
-            auto pos = static_cast<uint64_t>(offset) + copied;
-            auto block_offset = pos / options_.block_size * options_.block_size;
-            auto block_size = std::min<uint64_t>(options_.block_size, size - block_offset);
-            auto key = prefix_ + std::to_string(pos / options_.block_size);
-            std::vector<char> data;
-            auto result = store_->get(key, HEADER + block_size, data);
-            bool hit = result == Result::Hit && valid(key, data, block_offset, block_size);
-            if (hit) {
-                stats_->hits++;
-                LOG_DEBUG("moonpool hit key=`, bytes=`", key, block_size);
-            } else {
-                if (result == Result::Hit)
-                    stats_->corrupt++;
-                else if (result == Result::Miss)
-                    stats_->misses++;
-                else
-                    stats_->errors++;
-                LOG_DEBUG("moonpool fallback key=`, reason=`", key, static_cast<int>(result));
-                data.assign(HEADER + block_size, 0);
-                size_t read = 0;
-                while (read < block_size) {
-                    auto ret = source_->pread(data.data() + HEADER + read, block_size - read,
-                                              block_offset + read);
-                    if (ret < 0 && errno == EINTR)
-                        continue;
-                    if (ret <= 0 || static_cast<size_t>(ret) > block_size - read) {
-                        if (ret >= 0)
-                            errno = EIO;
-                        return copied ? static_cast<ssize_t>(copied) : -1;
-                    }
-                    read += ret;
-                    stats_->origin_bytes += ret;
-                }
-                memcpy(data.data(), MAGIC, 8);
-                encode64(data.data() + 8, block_size);
-                encode64(data.data() + 16, block_offset);
-                checksum(key, data, reinterpret_cast<unsigned char *>(data.data() + 24));
+            const auto first = (static_cast<uint64_t>(offset) + copied) / options_.block_size;
+            const auto last = (static_cast<uint64_t>(offset) + count - 1) / options_.block_size;
+            const auto blocks = std::min<uint64_t>(options_.batch_blocks, last - first + 1);
+            std::vector<ReadRequest> requests(blocks);
+            for (size_t i = 0; i < blocks; ++i) {
+                requests[i].key = prefix_ + std::to_string(first + i);
+                requests[i].capacity = HEADER + std::min<uint64_t>(
+                    options_.block_size, size - (first + i) * options_.block_size);
             }
-            auto begin = pos - block_offset;
-            auto n = std::min<uint64_t>(count - copied, block_size - begin);
-            memcpy(static_cast<char *>(buf) + copied, data.data() + HEADER + begin, n);
-            copied += n;
-            if (!hit)
-                store_->put(key, std::move(data));
+            store_->get_batch(requests);
+            for (size_t i = 0; i < blocks; ++i) {
+                const auto block_offset = (first + i) * options_.block_size;
+                const auto block_size = requests[i].capacity - HEADER;
+                const auto &key = requests[i].key;
+                auto &data = requests[i].data;
+                auto result = requests[i].result;
+                bool hit = result == Result::Hit && valid(key, data, block_offset, block_size);
+                if (hit) {
+                    stats_->hits++;
+                    LOG_DEBUG("moonpool hit key=`, bytes=`", key, block_size);
+                } else {
+                    if (result == Result::Hit)
+                        stats_->corrupt++;
+                    else if (result == Result::Miss)
+                        stats_->misses++;
+                    else
+                        stats_->errors++;
+                    if (options_.fallback == "none") {
+                        stats_->denied++;
+                        // A missing object is absence; a corrupt object or a failed RPC
+                        // is an I/O error. Neither permits origin access or a put.
+                        errno = result == Result::Miss ? ENOENT : EIO;
+                        LOG_ERROR("moonpool denied key=`, reason=`, errno=`", key,
+                                  static_cast<int>(result), errno);
+                        return -1;
+                    }
+                    LOG_DEBUG("moonpool fallback key=`, reason=`", key, static_cast<int>(result));
+                    data.assign(HEADER + block_size, 0);
+                    size_t read = 0;
+                    while (read < block_size) {
+                        auto ret = source_->pread(data.data() + HEADER + read, block_size - read,
+                                                  block_offset + read);
+                        if (ret < 0 && errno == EINTR)
+                            continue;
+                        if (ret <= 0 || static_cast<size_t>(ret) > block_size - read) {
+                            if (ret >= 0)
+                                errno = EIO;
+                            return copied ? static_cast<ssize_t>(copied) : -1;
+                        }
+                        read += ret;
+                        stats_->origin_bytes += ret;
+                    }
+                    memcpy(data.data(), MAGIC, 8);
+                    encode64(data.data() + 8, block_size);
+                    encode64(data.data() + 16, block_offset);
+                    checksum(key, data, reinterpret_cast<unsigned char *>(data.data() + 24));
+                }
+                const auto begin = static_cast<uint64_t>(offset) + copied - block_offset;
+                const auto n = std::min<uint64_t>(count - copied, block_size - begin);
+                memcpy(static_cast<char *>(buf) + copied, data.data() + HEADER + begin, n);
+                copied += n;
+                if (!hit)
+                    store_->put(key, std::move(data));
+            }
         }
         return copied;
     }
@@ -382,23 +403,44 @@ public:
                 errno = EINVAL;
                 return -1;
             }
+            if (iov[i].iov_len && !iov[i].iov_base) {
+                errno = EFAULT;
+                return -1;
+            }
             total += iov[i].iov_len;
         }
         if (total > static_cast<uint64_t>(INT64_MAX - offset)) {
             errno = EINVAL;
             return -1;
         }
-        size_t copied = 0;
-        for (int i = 0; i < iovcnt; ++i) {
-            auto n = pread(iov[i].iov_base, iov[i].iov_len, offset + copied);
+        std::vector<char> buffer(std::min(total, options_.block_size * options_.batch_blocks));
+        size_t copied = 0, within = 0;
+        int index = 0;
+        while (copied < total) {
+            const auto wanted = std::min(buffer.size(), total - copied);
+            auto n = pread(buffer.data(), wanted, offset + copied);
             if (n < 0)
-                return copied ? static_cast<ssize_t>(copied) : n;
+                return options_.fallback == "none" || !copied ? -1 : static_cast<ssize_t>(copied);
+            size_t consumed = 0;
+            while (consumed < static_cast<size_t>(n)) {
+                while (index < iovcnt && within == iov[index].iov_len) {
+                    ++index;
+                    within = 0;
+                }
+                const auto bytes = std::min(static_cast<size_t>(n) - consumed,
+                                            iov[index].iov_len - within);
+                memcpy(static_cast<char *>(iov[index].iov_base) + within,
+                       buffer.data() + consumed, bytes);
+                consumed += bytes;
+                within += bytes;
+            }
             copied += n;
-            if (static_cast<size_t>(n) < iov[i].iov_len)
+            if (static_cast<size_t>(n) < wanted)
                 break;
         }
         return copied;
     }
+
 };
 
 class PoolFS final : public photon::fs::ForwardFS_Ownership {
@@ -438,6 +480,12 @@ public:
             return new PoolFile(source, this, store_, stats_, options,
                                 uri.key_prefix(options.name_space));
         }
+        // Bare registry URLs do not carry a trusted size. Opening them probes
+        // the origin, which is forbidden in cache-only mode; use moonpool URIs.
+        if (options_.fallback == "none") {
+            errno = ENOTSUP;
+            return nullptr;
+        }
         auto source = m_fs->open(path, flags, mode);
         if (!source)
             return nullptr;
@@ -453,14 +501,29 @@ public:
 
 IFileSystem *new_pool_fs(IFileSystem *source, const Options &options,
                          std::unique_ptr<Backend> backend, std::shared_ptr<Stats> stats) {
+    TransportConfig transport;
+    if (!resolve_transport(options.protocol, transport)) {
+        LOG_ERROR("unsupported moonpool protocol: `", options.protocol);
+        return nullptr;
+    }
     bool valid_namespace = !options.name_space.empty() && options.name_space.size() <= 64;
     for (auto c : options.name_space)
         valid_namespace &= (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-    if (!source || !valid_namespace || options.block_size < 4096 ||
+    if (!source || !valid_namespace ||
+        (options.fallback != "direct" && options.fallback != "none") ||
+        (!options.enable && options.fallback == "none") ||
+        options.batch_blocks < 1 || options.batch_blocks > 64 ||
+        options.block_size < 4096 ||
         options.block_size > 4 * 1024 * 1024 || options.block_size % 4096 || !options.timeout_ms ||
         options.timeout_ms > 60000 || !options.retry_ms || !options.queue_depth ||
         options.queue_depth > 256) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    // Bound payload memory while retaining the previously valid 4 MiB block
+    // size with the default batch of 16. Slots also carry a header/alignment.
+    if (std::max<size_t>(options.block_size, 65536) * options.batch_blocks > 64 * 1024 * 1024) {
         errno = EINVAL;
         return nullptr;
     }

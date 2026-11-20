@@ -18,6 +18,10 @@
 #include <photon/net/socket.h>
 #include <photon/net/http/url.h>
 #include <map>
+#include <fcntl.h>
+#include <cerrno>
+#include <photon/thread/thread.h>
+#include "overlaybd/moonpool/uri.h"
 #include <string>
 #include <string_view>
 #include "image_service.h"
@@ -127,21 +131,123 @@ EXIT:
     }
 };
 
+// Uses the live ImageService so preflight observes the same local cache, pool
+// namespace, transport and fallback policy as subsequent block-device reads.
+class PoolCheckHandler : public photon::net::http::HTTPHandler {
+    ImageService *service_;
+    bool stopping_ = false;
+    unsigned active_ = 0; // All handlers run on the owning Photon vCPU.
+
+    int check(const std::string &body, std::string &message) {
+        if (!service_->global_conf.pool().enable()) {
+            message = "Mooncake pool is disabled";
+            return 503;
+        }
+        if (service_->global_conf.pool().fallback() == "direct") {
+            message = "direct fallback: full-layer preflight skipped";
+            return 200;
+        }
+        rapidjson::Document cfg;
+        cfg.Parse(body.c_str());
+        if (cfg.HasParseError() || !cfg.IsObject() ||
+            !cfg.HasMember("repoBlobUrl") || !cfg["repoBlobUrl"].IsString() ||
+            !cfg.HasMember("file") || !cfg["file"].IsString() ||
+            !cfg.HasMember("digest") || !cfg["digest"].IsString() ||
+            !cfg.HasMember("size") || !cfg["size"].IsUint64() ||
+            !cfg.HasMember("zfileBlockSize") || !cfg["zfileBlockSize"].IsUint()) {
+            message = "invalid pool layer metadata";
+            return 400;
+        }
+        auto path = MoonPool::resolve_uri(cfg["file"].GetString(), cfg["repoBlobUrl"].GetString(),
+                                         cfg["digest"].GetString(), cfg["size"].GetUint64(),
+                                         cfg["zfileBlockSize"].GetUint());
+        if (path.empty()) {
+            message = "invalid moonpool URI or layer metadata";
+            return 400;
+        }
+        std::unique_ptr<IFile> file(service_->global_fs.cached_fs->open(path.c_str(), O_RDONLY));
+        if (!file) {
+            message = "cache-only layer open failed";
+            return 503;
+        }
+        const auto size = cfg["size"].GetUint64();
+        std::vector<char> buffer(1024 * 1024);
+        for (uint64_t offset = 0; offset < size;) {
+            if (stopping_) {
+                message = "pool preflight service is stopping";
+                return 503;
+            }
+            const auto count = std::min<uint64_t>(buffer.size(), size - offset);
+            auto n = file->pread(buffer.data(), count, offset);
+            if (n <= 0 || static_cast<uint64_t>(n) > count) {
+                int error = errno;
+                message = "cache-only image unavailable: digest=" +
+                          std::string(cfg["digest"].GetString()) + ", offset=" +
+                          std::to_string(offset) + ", errno=" + std::to_string(error);
+                LOG_ERROR("moonpool pull preflight failed: `", message);
+                return error == ENOENT ? 404 : 503;
+            }
+            offset += n;
+        }
+        message = "cache-only layer verified";
+        return 200;
+    }
+
+public:
+    explicit PoolCheckHandler(ImageService *service) : service_(service) {}
+    void stop() {
+        stopping_ = true;
+        while (active_)
+            photon::thread_usleep(1000);
+    }
+    int handle_request(photon::net::http::Request &req, photon::net::http::Response &resp,
+                       std::string_view) override {
+        ++active_;
+        DEFER(--active_);
+        req.get_socket_stream()->timeout(5 * 1000000);
+        std::string message;
+        int code = 400;
+        const auto length = req.headers.content_length();
+        if (req.verb() != photon::net::http::Verb::POST || length == 0 || length > 16384) {
+            message = "POST a pool layer JSON object (maximum 16384 bytes)";
+        } else {
+            std::string body(length, '\0');
+            size_t received = 0;
+            while (received < length) {
+                auto n = req.read(&body[received], length - received);
+                if (n <= 0)
+                    break;
+                received += n;
+            }
+            if (received != length)
+                message = "incomplete pool preflight request";
+            else
+                code = check(body, message);
+        }
+        resp.set_result(code);
+        resp.headers.content_length(message.size());
+        resp.keep_alive(false);
+        return resp.write(message.data(), message.size()) == static_cast<ssize_t>(message.size()) ? 0 : -1;
+    }
+};
+
 struct ApiServer {
     photon::net::ISocketServer* tcpserver = nullptr;
     photon::net::http::HTTPServer* httpserver = nullptr;
     ApiHandler* handler = nullptr;
+    PoolCheckHandler* pool_handler = nullptr;
 
-    ApiServer(ImageService *imgservice) : handler(new ApiHandler(imgservice)) {}
+    ApiServer(ImageService *imgservice) : handler(new ApiHandler(imgservice)),
+        pool_handler(new PoolCheckHandler(imgservice)) {}
 
     ~ApiServer() {
+        if (tcpserver)
+            tcpserver->terminate();
+        pool_handler->stop();
+        safe_delete(tcpserver);
+        safe_delete(httpserver);
         delete handler;
-        if(tcpserver) {
-            safe_delete(tcpserver);
-        }
-        if(httpserver) {
-            safe_delete(httpserver);
-        }
+        delete pool_handler;
     }
 
     int init(const std::string &addr) {
@@ -159,6 +265,7 @@ struct ApiServer {
             LOG_ERRNO_RETURN(0, -1, "Failed to listen api server port `", url.port());
         httpserver = photon::net::http::new_http_server();
         httpserver->add_handler(handler, false, "/snapshot");
+        httpserver->add_handler(pool_handler, false, "/pool/check");
         tcpserver->set_handler(httpserver->get_connection_handler());
         tcpserver->start_loop();
         LOG_DEBUG("Api server listening on `:`, path: `", host, url.port(), "/snapshot");

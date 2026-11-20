@@ -1,4 +1,4 @@
-add_library(moonpool_lib STATIC pool_fs.cpp uri.cpp)
+add_library(moonpool_lib STATIC pool_fs.cpp uri.cpp transport.cpp)
 target_include_directories(moonpool_lib PUBLIC ${PHOTON_INCLUDE_DIR})
 target_link_libraries(moonpool_lib PUBLIC photon_static OpenSSL::Crypto pthread)
 

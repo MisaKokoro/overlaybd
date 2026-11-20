@@ -256,6 +256,22 @@ int ImageService::read_global_config_and_set() {
     if (!global_conf.ParseJSON(m_config_path)) {
         LOG_ERROR_RETURN(0, -1, "error parse global config json: `", m_config_path);
     }
+    if (global_conf.HasMember("pool")) {
+        const auto &pool = global_conf["pool"];
+        if (!pool.IsObject() ||
+            (pool.HasMember("protocol") && !pool["protocol"].IsString()) ||
+            (pool.HasMember("fallback") && !pool["fallback"].IsString()) ||
+            (pool.HasMember("batchBlocks") && !pool["batchBlocks"].IsUint())) {
+            LOG_ERROR_RETURN(EINVAL, -1, "invalid pool protocol/fallback/batchBlocks types");
+        }
+    }
+    if (global_conf.pool().fallback() == "none" && !global_conf.serviceConfig().enable()) {
+        LOG_ERROR_RETURN(EINVAL, -1, "pool.fallback=none requires serviceConfig.enable for pull preflight");
+    }
+    if (global_conf.pool().fallback() == "none" &&
+        (global_conf.p2pConfig().enable() || global_conf.download().enable())) {
+        LOG_ERROR_RETURN(EINVAL, -1, "pool.fallback=none forbids P2P and background origin download");
+    }
     uint32_t ioengine = global_conf.ioEngine();
     if (ioengine > 2) {
         LOG_ERROR_RETURN(0, -1, "unknown io_engine: `", ioengine);
@@ -478,6 +494,9 @@ int ImageService::init() {
             options.metadata_server = conf.metadataServer();
             options.local_hostname = conf.localHostname();
             options.name_space = conf.nameSpace();
+            options.protocol = conf.protocol();
+            options.batch_blocks = conf.batchBlocks();
+            options.fallback = conf.fallback();
             options.block_size = conf.blockSize();
             options.timeout_ms = conf.timeoutMs();
             options.retry_ms = conf.retryMs();
@@ -611,6 +630,10 @@ ImageFile *ImageService::create_image_file(const char *config_path, const std::s
         LOG_ERROR_RETURN(0, nullptr, "error parse image config");
     }
 
+    if (global_conf.pool().fallback() == "none" && cfg.download().enable()) {
+        LOG_ERROR_RETURN(EINVAL, nullptr, "cache-only image forbids background download");
+    }
+
     if (!cfg.HasMember("download") && !defaultDlCfg.IsNull() &&
         defaultDlCfg.HasMember("download")) {
         cfg.AddMember("download", defaultDlCfg["download"], cfg.GetAllocator());
@@ -664,6 +687,9 @@ ImageService::ImageService(const char *config_path) {
 }
 
 ImageService::~ImageService() {
+    // Drain preflight reads before releasing their backing filesystems.
+    stop_api_server(api_server);
+    api_server = nullptr;
     delete global_fs.media_file;
     delete global_fs.namespace_fs;
     delete global_fs.cached_fs;
@@ -671,7 +697,6 @@ ImageService::~ImageService() {
     delete global_fs.srcfs;
     delete global_fs.io_alloc;
     delete exporter;
-    stop_api_server(api_server);
     
     LOG_INFO("image service is fully stopped");
 }

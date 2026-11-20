@@ -111,6 +111,7 @@ struct FakeState {
     std::map<std::string, std::vector<char>> objects;
     std::atomic<bool> fail_get{false}, fail_put{false}, destroyed{false}, active{false};
     std::atomic<unsigned> delay_ms{0};
+    std::atomic<unsigned> batches{0}, max_batch{0};
 };
 class FakeBackend : public Backend {
     std::shared_ptr<FakeState> state_;
@@ -132,6 +133,11 @@ public:
             return Result::Miss;
         data = it->second;
         return Result::Hit;
+    }
+    void get_batch(std::vector<ReadRequest> &requests) override {
+        state_->batches++;
+        state_->max_batch = std::max<unsigned>(state_->max_batch.load(), requests.size());
+        Backend::get_batch(requests);
     }
     bool put(const std::string &key, const std::vector<char> &data) override {
         if (state_->fail_put)
@@ -496,6 +502,107 @@ void scheme(bool real = false) {
         << "moonpool URI parsing, metadata validation, lazy origin, isolation and routing: PASS\n";
 }
 
+std::string fixture_uri(Fixture &f) {
+    const auto path = path_for(*f.source);
+    const auto digest = path.substr(path.rfind('/') + 1);
+    return resolve_uri("moonpool://v1/b/" + digest + "?bs=4096&tenant=test",
+                       "http://registry.test/v2/image/blobs", digest, f.source->data.size(), 4096);
+}
+
+void batches_and_strict(bool real = false) {
+    Fixture f;
+    f.options.batch_blocks = 2;
+    f.options.timeout_ms = 5000;
+    if (real)
+        f.options.name_space = "batch-" + std::to_string(getpid()) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+    f.start(real);
+    const auto path = fixture_uri(f);
+    auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
+    CHECK(file);
+    f.read_all(file.get());
+    wait_for([&] { return f.stats->puts == 4; });
+    CHECK(f.stats->batches == 2 && f.stats->batch_blocks == 4);
+    if (!real)
+        CHECK(f.cache->batches == 2 && f.cache->max_batch == 2);
+    file.reset();
+    f.fs.reset();
+    f.options.fallback = "none";
+    f.source->fail_open = f.source->fail = true;
+    auto opens = f.source->opens.load();
+    auto reads = f.source->reads.load();
+    f.start(real);
+    file.reset(f.fs->open(path.c_str(), O_RDONLY));
+    CHECK(file);
+    f.read_all(file.get());
+    CHECK(f.source->opens == opens && f.source->reads == reads);
+    CHECK(f.stats->hits == 4 && f.stats->puts == 4);
+    CHECK(!f.fs->open(path_for(*f.source).c_str(), O_RDONLY) && errno == ENOTSUP);
+    CHECK(f.source->opens == opens);
+    if (real) {
+        std::cout << "real batched C ABI and cache-only warm read: PASS\n";
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(f.cache->mutex);
+        // Remove a later block, so the request also contains a valid hit.
+        auto it = f.cache->objects.begin();
+        ++it;
+        f.cache->objects.erase(it);
+    }
+    std::vector<char> data(f.source->data.size());
+    CHECK(file->pread(data.data(), data.size(), 0) == -1 && errno == ENOENT);
+    CHECK(f.source->opens == opens && f.source->reads == reads && f.stats->puts == 4);
+    {
+        std::lock_guard<std::mutex> lock(f.cache->mutex);
+        f.cache->objects.begin()->second.back() ^= 1;
+    }
+    CHECK(file->pread(data.data(), 1, 0) == -1 && errno == EIO);
+    f.cache->fail_get = true;
+    CHECK(file->pread(data.data(), 1, 0) == -1 && errno == EIO);
+    CHECK(f.source->opens == opens && f.source->reads == reads && f.stats->puts == 4);
+
+    Fixture empty;
+    empty.options.fallback = "none";
+    empty.start();
+    auto missing = std::unique_ptr<IFile>(empty.fs->open(fixture_uri(empty).c_str(), O_RDONLY));
+    CHECK(missing && missing->pread(data.data(), 1, 0) == -1 && errno == ENOENT);
+    CHECK(empty.source->opens == 0 && empty.source->reads == 0 && empty.stats->puts == 0);
+
+    Fixture slow;
+    slow.options.fallback = "none";
+    slow.options.timeout_ms = 20;
+    slow.cache->delay_ms = 100;
+    slow.start();
+    auto late = std::unique_ptr<IFile>(slow.fs->open(fixture_uri(slow).c_str(), O_RDONLY));
+    CHECK(late && late->pread(data.data(), data.size(), 0) == -1 && errno == EIO);
+    CHECK(slow.stats->timeouts == 1 && slow.source->opens == 0 && slow.stats->puts == 0);
+    late.reset(); slow.fs.reset();
+    wait_for([&] { return slow.cache->destroyed.load(); });
+    std::cout << "bounded batches, partial hit, cache-only miss/corruption/RPC timeout: PASS\n";
+}
+
+void options_validation() {
+    TransportConfig transport;
+    CHECK(resolve_transport("tcp", transport) && transport.protocol == "tcp");
+    CHECK(!resolve_transport("rdma", transport) && errno == ENOTSUP);
+    CHECK(!resolve_transport("ub", transport) && errno == ENOTSUP);
+    CHECK(!resolve_transport("unknown", transport) && errno == EINVAL);
+    Fixture f;
+    std::unique_ptr<SourceFS> source(new SourceFS(f.source));
+    for (size_t n : {size_t(0), size_t(65), SIZE_MAX}) {
+        Options options; options.batch_blocks = n;
+        CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
+    }
+    Options options; options.fallback = "typo";
+    CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
+    options.fallback = "none"; options.enable = false;
+    CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
+    options = Options(); options.block_size = 4*1024*1024; options.batch_blocks = 64;
+    CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
+    std::cout << "transport selection and pool option validation: PASS\n";
+}
+
 int main(int argc, char **argv) {
     if (photon::init(photon::INIT_EVENT_DEFAULT, photon::INIT_IO_DEFAULT) != 0)
         return 1;
@@ -506,6 +613,7 @@ int main(int argc, char **argv) {
         else if (argc == 2 && std::string(argv[1]) == "--real") {
             basic(true);
             scheme(true);
+            batches_and_strict(true);
         } else if (argc == 1) {
             basic();
             failures();
@@ -513,6 +621,8 @@ int main(int argc, char **argv) {
             isolation_and_truncation();
             late_completion();
             scheme();
+            batches_and_strict();
+            options_validation();
         } else {
             throw std::runtime_error("usage: moonpool_test [--real | --real-recovery <directory>]");
         }
