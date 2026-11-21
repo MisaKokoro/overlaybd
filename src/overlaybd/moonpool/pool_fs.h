@@ -32,7 +32,7 @@ struct Stats {
     std::atomic<uint64_t> batches{0}, batch_blocks{0}, denied{0};
 };
 
-enum class Result { Hit, Miss, Error };
+enum class Result { Hit, Miss, Error, ResourceError };
 
 struct ReadRequest {
     std::string key;

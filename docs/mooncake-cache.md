@@ -8,7 +8,7 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
                                      └─ 回源读取 → RegistryFS
 ```
 
-默认的 `fallback="direct"` 模式下，缓存未命中、访问出错、超时、工作队列已满或缓存对象校验失败时，读取请求会通过 RegistryFS 回源。完整块回源成功后，异步写入 Mooncake。缓存写入失败不会导致镜像读取失败；源站读取失败仍会将错误返回给调用方。该功能默认关闭。
+默认的 `fallback="direct"` 模式下，缓冲分配/注册失败明确报错且不回源；缓存未命中、访问出错、超时、工作队列已满或缓存对象校验失败时，读取请求会通过 RegistryFS 回源。完整块回源成功后，异步写入 Mooncake。缓存写入失败不会导致镜像读取失败；源站读取失败仍会将错误返回给调用方。该功能默认关闭。
 
 当前缓存的是 ZFile 解压前的原始 blob 字节，不负责将 OCI 镜像转换为 OverlayBD 格式。已支持 `moonpool://` URI scheme：配套 snapshotter 将远端只读层写成池地址，OverlayBD 解析后交给 PoolFile。containerd 无需修改，snapshotter 需要配套的路径生成改动。旧的 Registry 透明缓存模式仍可通过 `pool.cacheRegistry` 保留。
 
@@ -134,7 +134,7 @@ moonpool://v1/t/team-a/sha256:<摘要>?bs=4096&tenant=team-a
 
 `<摘要>` 必须替换为真实的 64 位小写十六进制摘要。路径描述整个 blob，块编号由读取偏移计算。解析器拒绝未知版本、无效摘要、重复或未知参数、缺失参数、非法租户，以及私有层路径与参数中的租户不一致。租户字符约束与命名空间相同，且不能单独为 `.` 或 `..`。
 
-**当前 OverlayBD 1.0.18 的 ZFile 最大块大小是 65536 字节。** URI 中 `bs` 必须为 4096～65536 之间的 4096 整数倍，不能照搬设计文档中 524288 的示例。全局 `pool.blockSize` 是兼容透明模式的原始字节块大小；显式 URI 使用各层的 `bs`。
+**URI 的 bs 是原始 blob 缓存块大小，与 ZFile 压缩块大小独立。** 范围为 4096～4194304，按 4096 对齐。全局 pool.blockSize 与 snapshotter poolBlockSize 均默认 262144；预热端使用相同大小。具体层始终以 URI 为准，不用全局值重新解释。
 
 snapshotter 配置示例：
 
@@ -142,6 +142,7 @@ snapshotter 配置示例：
 {
   "poolEnable": true,
   "poolFsVersion": "v1",
+  "poolBlockSize": 262144,
   "poolTenant": "mooncake",
   "poolPrivate": false
 }
@@ -149,9 +150,9 @@ snapshotter 配置示例：
 
 原有数字型 `tenant` 用于 snapshotter 设备隔离，与新增的 `poolTenant` 不同。`poolPrivate=true` 生成私有层地址，否则生成公共层地址。只对原生 OverlayBD 远端只读层生成 URI，本地层、可写层和 turboOCI 保持原有路径。
 
-生成 URI 需要有效的 blob 摘要、正数 blob 大小，以及该层的 `containerd.io/snapshot/overlaybd/zfile-config` 注解，例如 `{"algorithm":"lz4","blockSize":4096}`。缺少注解、算法或块大小不支持时返回错误，不猜测块大小。旧镜像需要按真实 ZFile 元数据补齐注解，或关闭 `poolEnable`。开关控制新生成的快照，已有快照不会自动改写。
+生成 URI 仅需要有效的 blob 摘要、正数大小和独立的缓存块配置。不再读取或要求 zfile-config 注解；不需要补写 manifest。原有 ZFile 解析继续检查真实格式。
 
-层配置保留原摘要、大小和下载目录，同时新增 `file` 和 `zfileBlockSize`：
+层配置保留原摘要、大小和下载目录，同时新增 `file`：
 
 ```json
 {
@@ -160,23 +161,22 @@ snapshotter 配置示例：
     "file": "moonpool://v1/b/sha256:<摘要>?bs=4096&tenant=mooncake",
     "digest": "sha256:<摘要>",
     "size": 123456789,
-    "zfileBlockSize": 4096,
     "dir": "/var/lib/overlaybd/snapshots/123/fs"
   }]
 }
 ```
 
-OverlayBD 在访问缓存前校验 URI 与层元数据一致，读取层头部后还会校验 `bs` 与真实 ZFile 头部一致。失败时拒绝打开该层，不静默切换到另一种解释。回源地址由 `repoBlobUrl` 和摘要构造，复用 RegistryFS 的认证、证书与请求逻辑。URI 不携带凭据或任意回源地址；内部编码的回源上下文不是对外参数，在层 URI 中自行附加会被拒绝。
+OverlayBD 在访问缓存前校验 URI 与层元数据一致，不再要求缓存 bs 与 ZFile 头部相同。失败时拒绝打开该层，不静默切换到另一种解释。回源地址由 `repoBlobUrl` 和摘要构造，复用 RegistryFS 的认证、证书与请求逻辑。URI 不携带凭据或任意回源地址；内部编码的回源上下文不是对外参数，在层 URI 中自行附加会被拒绝。
 
 OverlayBD 的 `pool.cacheRegistry` 默认是 `true`，兼容第一版透明缓存。按 scheme 接入建议设为 `false`，此时只有池地址走 Mooncake，普通远端层保持原有读取方式。`pool.enable=false` 仍能解析池地址，但直接回源，不创建 SDK 客户端；已链接的动态库仍是进程启动依赖。
 
-开发机器上的 `scripts/start-overlaybd-scheme.sh` 启动配套二进制，`scripts/test-overlaybd-scheme.sh` 验证 snapshotter 自动生成的 URI、旧路径兼容、关闭缓存、冷读、热读和故障恢复。每阶段使用全新的本地缓存和快照。测试镜像的注解由 `scripts/prepare-scheme-fixture.py` 从实际 ZFile 头部提取后写入独立的 `obd-baseline:scheme` 标签，不修改原 `native` 标签。
+历史验证记录（旧基线，不作为本次解耦验收）：`scripts/start-overlaybd-scheme.sh` 启动配套二进制，`scripts/test-overlaybd-scheme.sh` 曾验证 snapshotter 自动生成的 URI、旧路径兼容、关闭缓存、冷读、热读和故障恢复。每阶段使用全新的本地缓存和快照。测试镜像的注解由 `scripts/prepare-scheme-fixture.py` 从实际 ZFile 头部提取后写入独立的 `obd-baseline:scheme` 标签，不修改原 `native` 标签。
 
-`moonpool_test` 另覆盖 URI 错误参数、元数据不一致、公共/私有层与租户隔离，以及新文件对象命中缓存时不打开源站。snapshotter 配套单元测试命令是 `go test ./pkg/snapshot -run TestMoonpoolLayer -count=1`。
+`moonpool_test` 另覆盖 URI 错误参数、元数据不一致、公共/私有层与租户隔离，以及新文件对象命中缓存时不打开源站。snapshotter 配套单元测试命令是 `go test ./pkg/snapshot -run TestMoonpool -count=1`。
 
 实际容器测试结果保存在 `results/overlaybd-scheme-e2e.json`：旧路径、关闭缓存、冷缓存、热缓存、后端不可用、恢复回填和恢复后热读均通过。两次热读各有 3234 次池命中、0 次回源、0 次 Registry blob 请求，所有阶段的文件 SHA256 一致。
 
-`scripts/test-overlaybd-scheme-invalid.sh` 将注解块大小故意写成 8192，真实头部为 4096；容器启动被明确拒绝，结果见 `results/overlaybd-scheme-invalid.json`。`scripts/test-overlaybd-scheme-recovery.sh` 保持同一池 URI、文件对象与工作线程存活，验证后端重启后重连、回填，并在源站读取强制失败时再次命中，结果见 `results/overlaybd-scheme-recovery.json`。
+历史 scheme 测试报告只说明当时基线；旧的注解块大小不一致拒绝测试不再适用于本次解耦版本。
 
 ## C 接口直接链接验证
 
@@ -241,3 +241,13 @@ manifest/config 仍由 Docker/containerd 从 Registry 获取；策略只覆盖�
 本轮测试包括：TCP 真实批量 C API；SDK 开/关构建的单元测试；空池和缺单块时 Docker pull 失败且零回源；完整池拉取/运行成功；本地缓存满足读取；已有快照在缓存失效后拒绝拉取；direct 模式冷读回源及热读命中。direct 的并发容器读在默认 200ms 预算下出现过等待失败后回源；2000ms 下已回填块正常命中，但尽力回填可能遗留缺块，需要再次读取才能补齐。这属于当前单工作线程和有界队列的限制，不能保证一次冷读后立即全量热命中。完整池 13410 块通过 839 次批量调用读取，最大批次为 16。仓库外证据见 `results/overlaybd-pool-options.json`。
 
 本轮只增加 protocol、batchBlocks 和 fallback；设计中的多 master、owner-only 写策略、fillLease、watcher 等未在本轮实现，原来的 nameSpace 等配置名称也没有统一重命名。
+
+## 独立缓存块实现与边界
+
+当前按最新协议使用新快照和新预热数据，不提供旧格式迁移兼容验收。不再生成或读取 zfileBlockSize 字段。Key 和 OBDPOOL1 的 64 字节头部格式不变。缓存块配置范围为 4 KiB～4 MiB，与真实 ZFile 压缩参数独立。
+
+每个全局配置及层 URI 的 `B * batchBlocks` 不得超过 64 MiB；超出时在初始化或打开层时明确拒绝。注册区由单个原生工作线程按每批实际最大 Value 容量和块数分配/扩容，包含头部及页对齐；总注册区最多 64 MiB 加 256 KiB 对齐开销。容量不依赖全局默认值。分配或注册失败返回资源错误，在 direct 模式下也不回源，避免把配置或资源问题伪装成缓存缺失。超时仍遵循原有策略，异步任务保留自己的数据生命周期。
+
+单元和真实 C SDK 用例覆盖 4 KiB、256 KiB、4 MiB、全局小块/URI 大块、单槽到批量缓冲扩容、尾块、不对齐 preadv、资源错误禁止回源以及层批量内存预算拒绝。独立测试包 `tools/portable-test` 默认 256 KiB，使用原始无 zfile-config 的 native 镜像验证。
+
+本次 Docker 验证使用没有 zfile-config 注解的原始 native 镜像，真实 ZFile 块为 4 KiB，缓存块为 256 KiB；211 块通过 54 次批量读取，最大实际批次 4，层数据零回源，容器文件 SHA256 校验通过。空池 pull 失败且不回源。新测试包支持通过 image/manifest/check-command/expect-output 验收外部预热结果。证据见工作区 `results/cache-block-decoupling.json`。

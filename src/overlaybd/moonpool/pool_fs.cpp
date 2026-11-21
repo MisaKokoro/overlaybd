@@ -351,7 +351,7 @@ public:
                         stats_->misses++;
                     else
                         stats_->errors++;
-                    if (options_.fallback == "none") {
+                    if (options_.fallback == "none" || result == Result::ResourceError) {
                         stats_->denied++;
                         // A missing object is absence; a corrupt object or a failed RPC
                         // is an I/O error. Neither permits origin access or a put.
@@ -472,6 +472,11 @@ public:
             URI uri;
             if (!parse_uri(path, uri, true))
                 return nullptr;
+            // Validate per-layer memory before any origin open or pool access.
+            // The URI is authoritative even when the global default differs.
+            if (uri.block_size > (64 * 1024 * 1024) / options_.batch_blocks) {
+                LOG_ERROR_RETURN(EINVAL, nullptr, "moonpool URI batch exceeds 64 MiB payload budget");
+            }
             auto source = new LazyOrigin(m_fs, uri);
             if (!options_.enable)
                 return source;
@@ -523,7 +528,7 @@ IFileSystem *new_pool_fs(IFileSystem *source, const Options &options,
     }
     // Bound payload memory while retaining the previously valid 4 MiB block
     // size with the default batch of 16. Slots also carry a header/alignment.
-    if (std::max<size_t>(options.block_size, 65536) * options.batch_blocks > 64 * 1024 * 1024) {
+    if (options.block_size * options.batch_blocks > 64 * 1024 * 1024) {
         errno = EINVAL;
         return nullptr;
     }

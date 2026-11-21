@@ -32,7 +32,6 @@ struct LayerConfig : public ConfigUtils::Config {
     APPCFG_PARA(dir, std::string, "");
     APPCFG_PARA(digest, std::string, "");
     APPCFG_PARA(targetDigest, std::string, "");
-    APPCFG_PARA(zfileBlockSize, uint32_t, 0);
     APPCFG_PARA(size, uint64_t, 0);
 };
 

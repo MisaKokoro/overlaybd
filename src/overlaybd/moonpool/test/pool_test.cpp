@@ -109,7 +109,7 @@ public:
 struct FakeState {
     std::mutex mutex;
     std::map<std::string, std::vector<char>> objects;
-    std::atomic<bool> fail_get{false}, fail_put{false}, destroyed{false}, active{false};
+    std::atomic<bool> resource_error{false}, fail_get{false}, fail_put{false}, destroyed{false}, active{false};
     std::atomic<unsigned> delay_ms{0};
     std::atomic<unsigned> batches{0}, max_batch{0};
 };
@@ -125,6 +125,8 @@ public:
     Result get(const std::string &key, size_t, std::vector<char> &data) override {
         state_->active = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(state_->delay_ms.load()));
+        if (state_->resource_error)
+            return Result::ResourceError;
         if (state_->fail_get)
             return Result::Error;
         std::lock_guard<std::mutex> lock(state_->mutex);
@@ -374,7 +376,7 @@ void real_recovery(const std::string &directory) {
     auto digest = path_for(*f.source).substr(path_for(*f.source).rfind('/') + 1);
     auto uri = "moonpool://v1/b/" + digest + "?bs=4096&tenant=mooncake";
     auto path = resolve_uri(uri, "http://registry.test/v2/image/blobs", digest,
-                            f.source->data.size(), 4096);
+                            f.source->data.size());
     auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
     CHECK(file);
     auto signal = [&](const char *name) {
@@ -431,7 +433,7 @@ void scheme(bool real = false) {
     URI parsed;
     CHECK(parse_uri(uri, parsed) && parsed.block_size == 4096 && !parsed.private_layer);
     auto resolved = resolve_uri(uri, "http://registry.test/v2/image/blobs", digest,
-                                f.source->data.size(), 4096);
+                                f.source->data.size());
     CHECK(!resolved.empty());
     CHECK(parse_uri("/" + resolved, parsed, true));
     CHECK(parsed.origin == "http://registry.test/v2/image/blobs/" + digest);
@@ -454,7 +456,7 @@ void scheme(bool real = false) {
     for (const auto &bad : std::vector<std::string>{
              "moonpool://v2/b/" + digest + "?bs=4096&tenant=x",
              "moonpool://v1/b/sha256:bad?bs=4096&tenant=x", uri + "&bs=4096", uri + "&unknown=x",
-             uri + "&", uri + "#fragment", "moonpool://v1/b/" + digest + "?bs=524288&tenant=x",
+             uri + "&", uri + "#fragment", "moonpool://v1/b/" + digest + "?bs=4198400&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=4097&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=999999999999999999999&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=4096&tenant=../x",
@@ -462,17 +464,17 @@ void scheme(bool real = false) {
              "moonpool://v1/t/a/" + digest + "?bs=4096&tenant=b"}) {
         CHECK(!parse_uri(bad, parsed) && errno == EINVAL);
     }
-    CHECK(resolve_uri(uri, "http://host/blobs", digest, 10, 8192).empty());
-    CHECK(resolve_uri(uri, "file:///tmp", digest, 10, 4096).empty());
-    CHECK(resolve_uri(uri, "http://user:pass@host/blobs", digest, 10, 4096).empty());
-    CHECK(resolve_uri(uri, "http://host/blobs", "sha256:bad", 10, 4096).empty());
-    CHECK(resolve_uri(uri, "http://host/blobs", digest, 0, 4096).empty());
+    CHECK(!resolve_uri(uri, "http://host/blobs", digest, 10).empty());
+    CHECK(resolve_uri(uri, "file:///tmp", digest, 10).empty());
+    CHECK(resolve_uri(uri, "http://user:pass@host/blobs", digest, 10).empty());
+    CHECK(resolve_uri(uri, "http://host/blobs", "sha256:bad", 10).empty());
+    CHECK(resolve_uri(uri, "http://host/blobs", digest, 0).empty());
 
     if (!real) {
         f.source->fail = f.source->fail_open = false;
         auto priv = "moonpool://v1/t/team-a/" + digest + "?bs=4096&tenant=team-a";
         auto priv_path = resolve_uri(priv, "http://registry.test/v2/image/blobs", digest,
-                                     f.source->data.size(), 4096);
+                                     f.source->data.size());
         CHECK(local_cache_name(priv_path, "ns") != local_cache_name(resolved, "ns"));
         file.reset(f.fs->open(priv_path.c_str(), O_RDONLY));
         f.read_all(file.get());
@@ -480,7 +482,7 @@ void scheme(bool real = false) {
         wait_for([&] { return f.stats->puts == 8; });
         auto other = "moonpool://v1/t/team-b/" + digest + "?bs=4096&tenant=team-b";
         auto other_path = resolve_uri(other, "http://registry.test/v2/image/blobs", digest,
-                                      f.source->data.size(), 4096);
+                                      f.source->data.size());
         file.reset(f.fs->open(other_path.c_str(), O_RDONLY));
         f.read_all(file.get());
         CHECK(f.stats->misses == 12);
@@ -506,7 +508,7 @@ std::string fixture_uri(Fixture &f) {
     const auto path = path_for(*f.source);
     const auto digest = path.substr(path.rfind('/') + 1);
     return resolve_uri("moonpool://v1/b/" + digest + "?bs=4096&tenant=test",
-                       "http://registry.test/v2/image/blobs", digest, f.source->data.size(), 4096);
+                       "http://registry.test/v2/image/blobs", digest, f.source->data.size());
 }
 
 void batches_and_strict(bool real = false) {
@@ -582,6 +584,55 @@ void batches_and_strict(bool real = false) {
     std::cout << "bounded batches, partial hit, cache-only miss/corruption/RPC timeout: PASS\n";
 }
 
+void independent_blocks(bool real = false) {
+    for (size_t bs : {size_t(4096), size_t(262144), size_t(4194304)}) {
+        Fixture f;
+        f.options.block_size = 4096; // deliberately smaller than the layer URI
+        f.options.timeout_ms = 5000;
+        f.options.name_space = "independent-" + std::to_string(bs) + "-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        f.source->data.resize(2 * bs + 137);
+        for (size_t i = 0; i < f.source->data.size(); ++i) f.source->data[i] = (i * 37 + i / 251) % 256;
+        auto raw = path_for(*f.source);
+        auto digest = raw.substr(raw.rfind('/') + 1);
+        auto uri = "moonpool://v1/b/" + digest + "?bs=" + std::to_string(bs) + "&tenant=test";
+        URI parsed;
+        CHECK(parse_uri(uri, parsed) && parsed.block_size == bs);
+        auto path = resolve_uri(uri, "http://registry.test/v2/image/blobs", digest, f.source->data.size());
+        f.start(real);
+        auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
+        CHECK(file);
+        char first;
+        CHECK(file->pread(&first,1,0)==1 && first==f.source->data[0]);
+        wait_for([&]{ return f.stats->puts == 1; });
+        // Grow the same SDK handle from one slot to a full batch.
+        f.read_all(file.get());
+        wait_for([&]{ return f.stats->puts == 3; });
+        f.source->fail = f.source->fail_open = true;
+        auto reads = f.source->reads.load();
+        f.read_all(file.get());
+        std::vector<char> out(bs+17);
+        iovec iov[2]{{out.data(),7},{out.data()+7,out.size()-7}};
+        CHECK(file->preadv(iov,2,bs-9)==static_cast<ssize_t>(out.size()));
+        CHECK(std::equal(out.begin(),out.end(),f.source->data.begin()+bs-9));
+        CHECK(f.source->reads == reads);
+        if (!real) {
+            f.cache->resource_error = true;
+            CHECK(file->pread(&first,1,0)==-1 && errno==EIO);
+            CHECK(f.source->reads == reads); // resource errors never silently fall back
+        }
+    }
+    Fixture f;
+    f.options.batch_blocks = 64;
+    f.start();
+    auto raw = path_for(*f.source); auto digest = raw.substr(raw.rfind('/')+1);
+    auto path = resolve_uri("moonpool://v1/b/"+digest+"?bs=4194304&tenant=x",
+                            "http://host/blobs",digest,f.source->data.size());
+    CHECK(!f.fs->open(path.c_str(),O_RDONLY) && errno==EINVAL);
+    CHECK(f.source->opens==0);
+    std::cout << "independent 4KiB/256KiB/4MiB blocks, tail, preadv and buffer growth: PASS\n";
+}
+
 void options_validation() {
     TransportConfig transport;
     CHECK(resolve_transport("tcp", transport) && transport.protocol == "tcp");
@@ -614,6 +665,7 @@ int main(int argc, char **argv) {
             basic(true);
             scheme(true);
             batches_and_strict(true);
+            independent_blocks(true);
         } else if (argc == 1) {
             basic();
             failures();
@@ -623,6 +675,7 @@ int main(int argc, char **argv) {
             scheme();
             batches_and_strict();
             options_validation();
+            independent_blocks();
         } else {
             throw std::runtime_error("usage: moonpool_test [--real | --real-recovery <directory>]");
         }

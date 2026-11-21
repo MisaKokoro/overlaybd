@@ -19,12 +19,14 @@ class MooncakeBackend final : public Backend {
     void *buffer_ = nullptr;
     size_t capacity_ = 0;
     bool registered_ = false;
+    bool connected_ = false;
     std::chrono::steady_clock::time_point retry_after_{};
 
     void cleanup() {
         if (registered_)
             mooncake_store_unregister_buffer(store_, buffer_);
         registered_ = false;
+        connected_ = false;
         if (store_)
             mooncake_store_destroy(store_);
         store_ = nullptr;
@@ -33,7 +35,7 @@ class MooncakeBackend final : public Backend {
     }
 
     bool ready() {
-        if (registered_)
+        if (connected_)
             return true;
         auto now = std::chrono::steady_clock::now();
         if (now < retry_after_)
@@ -50,13 +52,40 @@ class MooncakeBackend final : public Backend {
                                  transport_.protocol.c_str(), transport_.device_name.c_str(),
                                  options_.master.c_str()) != 0)
             return false;
-        // Explicit layer URIs may use a different ZFile block size.
-        stride_ = (std::max<size_t>(options_.block_size, 65536) + 64 + 4095) / 4096 * 4096;
-        capacity_ = stride_ * options_.batch_blocks;
-        if (posix_memalign(&buffer_, 4096, capacity_) != 0)
+        connected_ = true;
+        return true;
+    }
+
+    bool ensure_buffer(size_t slot_size, size_t count) {
+        // Bound values before additions/multiplications; include header and
+        // page-alignment overhead (at most 4096 bytes per slot).
+        if (!count || count > options_.batch_blocks || slot_size < 64 ||
+            slot_size > 4 * 1024 * 1024 + 64 ||
+            slot_size - 64 > (64 * 1024 * 1024) / count)
             return false;
-        registered_ = mooncake_store_register_buffer(store_, buffer_, capacity_) == 0;
-        return registered_;
+        const size_t stride = (slot_size + 4095) / 4096 * 4096;
+        const size_t capacity = stride * count;
+        if (registered_ && capacity <= capacity_) {
+            stride_ = stride;
+            return true;
+        }
+        if (registered_ && mooncake_store_unregister_buffer(store_, buffer_) != 0)
+            return false;
+        registered_ = false;
+        free(buffer_);
+        buffer_ = nullptr;
+        capacity_ = 0;
+        if (posix_memalign(&buffer_, 4096, capacity) != 0)
+            return false;
+        if (mooncake_store_register_buffer(store_, buffer_, capacity) != 0) {
+            free(buffer_);
+            buffer_ = nullptr;
+            return false;
+        }
+        stride_ = stride;
+        capacity_ = capacity;
+        registered_ = true;
+        return true;
     }
 
     void invalidate() {
@@ -77,8 +106,10 @@ public:
     }
 
     Result get(const std::string &key, size_t capacity, std::vector<char> &value) override {
-        if (!ready() || capacity > stride_)
+        if (!ready())
             return Result::Error;
+        if (!ensure_buffer(capacity, 1))
+            return Result::ResourceError;
         auto size = mooncake_store_get_into(store_, key.c_str(), buffer_, capacity);
         if (size == -704)
             return Result::Miss; // Mooncake ErrorCode::OBJECT_NOT_FOUND
@@ -93,6 +124,14 @@ public:
     void get_batch(std::vector<ReadRequest> &requests) override {
         if (requests.empty() || requests.size() > options_.batch_blocks || !ready())
             return;
+        size_t slot_size = 0;
+        for (const auto &request : requests)
+            slot_size = std::max(slot_size, request.capacity);
+        if (!ensure_buffer(slot_size, requests.size())) {
+            for (auto &request : requests)
+                request.result = Result::ResourceError;
+            return;
+        }
         std::vector<const char *> keys;
         std::vector<void *> buffers;
         std::vector<size_t> sizes;

@@ -128,7 +128,7 @@ bool parse_uri(const std::string &path, URI &out, bool internal) {
     if (args.size() != (internal ? 4 : 2) || !args.count("bs") || !args.count("tenant"))
         return fail();
     uint64_t bs;
-    if (!number(args["bs"], bs) || bs < 4096 || bs > 65536 || bs % 4096)
+    if (!number(args["bs"], bs) || bs < 4096 || bs > 4 * 1024 * 1024 || bs % 4096)
         return fail();
     result.block_size = bs;
     result.tenant = args["tenant"];
@@ -143,10 +143,10 @@ bool parse_uri(const std::string &path, URI &out, bool internal) {
     return true;
 }
 std::string resolve_uri(const std::string &path, const std::string &repo, const std::string &digest,
-                        uint64_t size, uint32_t zbs) {
+                        uint64_t size) {
     URI uri;
     if (!parse_uri(path, uri) || (!digest.empty() && uri.digest != digest) || !size ||
-        size > uint64_t(INT64_MAX) || zbs != uri.block_size || repo.empty()) {
+        size > uint64_t(INT64_MAX) || repo.empty()) {
         errno = EINVAL;
         return {};
     }

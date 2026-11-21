@@ -261,8 +261,9 @@ int ImageService::read_global_config_and_set() {
         if (!pool.IsObject() ||
             (pool.HasMember("protocol") && !pool["protocol"].IsString()) ||
             (pool.HasMember("fallback") && !pool["fallback"].IsString()) ||
-            (pool.HasMember("batchBlocks") && !pool["batchBlocks"].IsUint())) {
-            LOG_ERROR_RETURN(EINVAL, -1, "invalid pool protocol/fallback/batchBlocks types");
+            (pool.HasMember("batchBlocks") && !pool["batchBlocks"].IsUint()) ||
+            (pool.HasMember("blockSize") && !pool["blockSize"].IsUint())) {
+            LOG_ERROR_RETURN(EINVAL, -1, "invalid pool protocol/fallback/batchBlocks/blockSize types");
         }
     }
     if (global_conf.pool().fallback() == "none" && !global_conf.serviceConfig().enable()) {

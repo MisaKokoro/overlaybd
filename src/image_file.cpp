@@ -153,7 +153,7 @@ void get_error_msg(int eno, std::string &err_msg) {
 
 IFile *ImageFile::__open_ro_remote(const std::string &dir, const std::string &digest,
                                    const uint64_t size, int layer_index,
-                                   const std::string &pool_path, uint32_t zfile_block_size) {
+                                   const std::string &pool_path) {
     if (conf.repoBlobUrl() == "") {
         set_failed("empty repoBlobUrl");
         LOG_ERROR_RETURN(0, nullptr, "empty repoBlobUrl for remote layer");
@@ -189,12 +189,6 @@ IFile *ImageFile::__open_ro_remote(const std::string &dir, const std::string &di
         LOG_ERRNO_RETURN(0, nullptr, "failed to open remote file as tar file `: `", url, err_msg);
     }
 
-    if (zfile_block_size &&
-        ZFile::zfile_block_size(tar_file) != static_cast<int>(zfile_block_size)) {
-        delete tar_file;
-        set_failed("moonpool block size does not match ZFile header");
-        LOG_ERROR_RETURN(EINVAL, nullptr, "moonpool block size does not match ZFile header");
-    }
     ISwitchFile *switch_file = new_switch_file(tar_file, false, url.c_str());
     if (!switch_file) {
         set_failed("failed to open switch file ", url);
@@ -296,7 +290,7 @@ int ImageFile::open_lower_layer(IFile *&file, ImageConfigNS::LayerConfig &layer,
     std::string opened;
     if (MoonPool::is_pool_uri(layer.file())) {
         auto path = MoonPool::resolve_uri(layer.file(), conf.repoBlobUrl(), layer.digest(),
-                                          layer.size(), layer.zfileBlockSize());
+                                          layer.size());
         if (path.empty()) {
             set_failed("invalid moonpool layer URI or metadata");
             LOG_ERROR_RETURN(EINVAL, -1, "invalid moonpool layer URI or metadata: `", layer.file());
@@ -304,7 +298,7 @@ int ImageFile::open_lower_layer(IFile *&file, ImageConfigNS::LayerConfig &layer,
         MoonPool::URI uri;
         MoonPool::parse_uri(layer.file(), uri);
         opened = layer.file();
-        file = __open_ro_remote(layer.dir(), uri.digest, layer.size(), index, path, uri.block_size);
+        file = __open_ro_remote(layer.dir(), uri.digest, layer.size(), index, path);
     } else {
         if (layer.file().find("://") != std::string::npos) {
             set_failed("unsupported layer file scheme");

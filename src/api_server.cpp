@@ -153,14 +153,12 @@ class PoolCheckHandler : public photon::net::http::HTTPHandler {
             !cfg.HasMember("repoBlobUrl") || !cfg["repoBlobUrl"].IsString() ||
             !cfg.HasMember("file") || !cfg["file"].IsString() ||
             !cfg.HasMember("digest") || !cfg["digest"].IsString() ||
-            !cfg.HasMember("size") || !cfg["size"].IsUint64() ||
-            !cfg.HasMember("zfileBlockSize") || !cfg["zfileBlockSize"].IsUint()) {
+            !cfg.HasMember("size") || !cfg["size"].IsUint64()) {
             message = "invalid pool layer metadata";
             return 400;
         }
         auto path = MoonPool::resolve_uri(cfg["file"].GetString(), cfg["repoBlobUrl"].GetString(),
-                                         cfg["digest"].GetString(), cfg["size"].GetUint64(),
-                                         cfg["zfileBlockSize"].GetUint());
+                                         cfg["digest"].GetString(), cfg["size"].GetUint64());
         if (path.empty()) {
             message = "invalid moonpool URI or layer metadata";
             return 400;
