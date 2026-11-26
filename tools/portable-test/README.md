@@ -117,7 +117,7 @@ python3 tools/portable-test/package.py \
 
 ## 独立缓存块大小
 
-此版本将 `--cache-block-size` 同时写入 OverlayBD 的 `pool.blockSize`、snapshotter 的 `poolBlockSize`，并用于 seed 的原始 blob 切片。范围为 4096～4194304，必须为 4096 的整数倍。它与 ZFile 压缩块大小无关，不再读取 zfile-config 注解决定缓存块大小。
+此版本将 `--cache-block-size` 同时写入 OverlayBD 的 `pool.blockSize`、snapshotter 的 `poolBlockSize`，并用于 seed 的原始 blob 切片。不再设置 4 MiB 上限，最小为 4096，必须为 4096 的整数倍。它与 ZFile 压缩块大小无关，不再读取 zfile-config 注解决定缓存块大小。
 
 自带测试镜像来自未补注解的 native 原始 manifest，包内标签为 `obd-baseline:pool`，层内 ZFile 为 4 KiB，默认池块为 256 KiB。Key/Value 仍遵守 moonpool-v1 / OBDPOOL1 格式。此前的测试包不具备此解耦功能。
 

@@ -1,6 +1,8 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "../pool_fs.h"
 #include "../uri.h"
+#include "../limits.h"
+#include <cstdlib>
 #include <algorithm>
 #include <chrono>
 #include <climits>
@@ -110,6 +112,7 @@ struct FakeState {
     std::mutex mutex;
     std::map<std::string, std::vector<char>> objects;
     std::atomic<bool> resource_error{false}, fail_get{false}, fail_put{false}, destroyed{false}, active{false};
+    std::atomic<bool> allocation_failure{false};
     std::atomic<unsigned> delay_ms{0};
     std::atomic<unsigned> batches{0}, max_batch{0};
 };
@@ -125,6 +128,8 @@ public:
     Result get(const std::string &key, size_t, std::vector<char> &data) override {
         state_->active = true;
         std::this_thread::sleep_for(std::chrono::milliseconds(state_->delay_ms.load()));
+        if (state_->allocation_failure)
+            throw std::bad_alloc();
         if (state_->resource_error)
             return Result::ResourceError;
         if (state_->fail_get)
@@ -174,6 +179,11 @@ struct Fixture {
     }
     void start(bool real = false) {
         std::unique_ptr<Backend> backend;
+        if (real) {
+            if (auto p = std::getenv("MOONPOOL_TEST_MASTER")) options.master = p;
+            if (auto p = std::getenv("MOONPOOL_TEST_METADATA")) options.metadata_server = p;
+            if (auto p = std::getenv("MOONPOOL_TEST_LOCAL_IP")) options.local_hostname = p;
+        }
         if (!real)
             backend.reset(new FakeBackend(cache));
         fs.reset(new_pool_fs(new SourceFS(source), options, std::move(backend), stats));
@@ -456,7 +466,7 @@ void scheme(bool real = false) {
     for (const auto &bad : std::vector<std::string>{
              "moonpool://v2/b/" + digest + "?bs=4096&tenant=x",
              "moonpool://v1/b/sha256:bad?bs=4096&tenant=x", uri + "&bs=4096", uri + "&unknown=x",
-             uri + "&", uri + "#fragment", "moonpool://v1/b/" + digest + "?bs=4198400&tenant=x",
+             uri + "&", uri + "#fragment", "moonpool://v1/b/" + digest + "?bs=9223372036854771712&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=4097&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=999999999999999999999&tenant=x",
              "moonpool://v1/b/" + digest + "?bs=4096&tenant=../x",
@@ -585,10 +595,10 @@ void batches_and_strict(bool real = false) {
 }
 
 void independent_blocks(bool real = false) {
-    for (size_t bs : {size_t(4096), size_t(262144), size_t(4194304)}) {
+    for (size_t bs : {size_t(4096), size_t(262144), size_t(4194304), size_t(8 << 20), size_t(80 << 20)}) {
         Fixture f;
         f.options.block_size = 4096; // deliberately smaller than the layer URI
-        f.options.timeout_ms = 5000;
+        f.options.timeout_ms = 30000;
         f.options.name_space = "independent-" + std::to_string(bs) + "-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
         f.source->data.resize(2 * bs + 137);
@@ -617,9 +627,14 @@ void independent_blocks(bool real = false) {
         CHECK(std::equal(out.begin(),out.end(),f.source->data.begin()+bs-9));
         CHECK(f.source->reads == reads);
         if (!real) {
+            CHECK(f.cache->max_batch <= read_batch_blocks(bs, f.options.batch_blocks));
             f.cache->resource_error = true;
             CHECK(file->pread(&first,1,0)==-1 && errno==EIO);
             CHECK(f.source->reads == reads); // resource errors never silently fall back
+            f.cache->resource_error = false;
+            f.cache->allocation_failure = true;
+            CHECK(file->pread(&first,1,0)==-1 && errno==EIO);
+            CHECK(f.source->reads == reads);
         }
     }
     Fixture f;
@@ -628,9 +643,55 @@ void independent_blocks(bool real = false) {
     auto raw = path_for(*f.source); auto digest = raw.substr(raw.rfind('/')+1);
     auto path = resolve_uri("moonpool://v1/b/"+digest+"?bs=4194304&tenant=x",
                             "http://host/blobs",digest,f.source->data.size());
-    CHECK(!f.fs->open(path.c_str(),O_RDONLY) && errno==EINVAL);
-    CHECK(f.source->opens==0);
-    std::cout << "independent 4KiB/256KiB/4MiB blocks, tail, preadv and buffer growth: PASS\n";
+    auto large = std::unique_ptr<IFile>(f.fs->open(path.c_str(),O_RDONLY));
+    CHECK(large);
+    f.read_all(large.get());
+    CHECK(f.source->opens==1);
+    std::cout << "independent blocks through 80MiB, tail, preadv and buffer growth: PASS\n";
+}
+
+void large_block_limits() {
+    CHECK(read_batch_blocks(8 << 20, 16) == 8);
+    CHECK(read_batch_blocks(64 << 20, 16) == 1);
+    CHECK(read_batch_blocks(80 << 20, 16) == 1);
+    CHECK(read_batch_blocks(4096, 64) == 64);
+    size_t stride = 0, capacity = 0;
+    CHECK(buffer_layout((80 << 20) + 64, 1, stride, capacity));
+    CHECK(stride == (80 << 20) + 4096 && capacity == stride);
+    CHECK(!buffer_layout(SIZE_MAX, 1, stride, capacity));
+    CHECK(!buffer_layout(64, SIZE_MAX, stride, capacity));
+    CHECK(!buffer_layout(64, 0, stride, capacity));
+    CHECK(!valid_block_size(MAX_BLOCK_SIZE + 4096));
+    const auto digest = "sha256:" + std::string(64, 'a');
+    for (uint64_t bs : {uint64_t(4198400), uint64_t(1) << 32, MAX_BLOCK_SIZE}) {
+        URI uri;
+        CHECK(parse_uri("moonpool://v1/b/" + digest + "?bs=" + std::to_string(bs) + "&tenant=x", uri));
+        CHECK(uri.block_size == bs);
+        Fixture f;
+        f.options.block_size = bs;
+        f.start();
+        auto path = resolve_uri(uri.canonical(), "http://host/blobs", digest, f.source->data.size());
+        auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
+        CHECK(file);
+        f.read_all(file.get()); // only the actual tail is allocated, even for enormous B
+        wait_for([&]{ return f.stats->puts == 1; });
+        f.source->fail = true;
+        f.read_all(file.get());
+    }
+    Fixture f;
+    f.options.block_size = 8 << 20;
+    f.options.batch_blocks = 16;
+    f.options.timeout_ms = 30000;
+    f.source->data.resize(9 * f.options.block_size + 137, 'b');
+    f.start();
+    auto file = f.open();
+    f.read_all(file.get());
+    wait_for([&]{ return f.stats->puts == 10; });
+    CHECK(f.cache->max_batch == 8);
+    f.source->fail = true;
+    f.read_all(file.get());
+    CHECK(f.cache->max_batch == 8);
+    std::cout << "large block arithmetic, 64-bit URI, tail allocation and batch splitting: PASS\n";
 }
 
 void options_validation() {
@@ -649,9 +710,33 @@ void options_validation() {
     CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
     options.fallback = "none"; options.enable = false;
     CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
-    options = Options(); options.block_size = 4*1024*1024; options.batch_blocks = 64;
+    options = Options(); options.block_size = SIZE_MAX; options.batch_blocks = 64;
     CHECK(!new_pool_fs(source.get(), options) && errno == EINVAL);
     std::cout << "transport selection and pool option validation: PASS\n";
+}
+
+void real_seeded(const char *blob_path, const char *block_size, const char *name_space) {
+    Fixture f;
+    f.options.name_space = name_space;
+    f.options.block_size = 4096; // seed's URI, not global configuration, controls the Key
+    f.options.fallback = "none";
+    f.options.timeout_ms = 30000;
+    std::ifstream input(blob_path, std::ios::binary);
+    CHECK(input.good());
+    f.source->data.assign(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+    CHECK(!f.source->data.empty());
+    auto raw = path_for(*f.source);
+    auto digest = raw.substr(raw.rfind('/') + 1);
+    auto path = resolve_uri("moonpool://v1/b/" + digest + "?bs=" + block_size + "&tenant=test",
+                            "http://registry.test/v2/image/blobs", digest, f.source->data.size());
+    CHECK(!path.empty());
+    f.source->fail = f.source->fail_open = true;
+    f.start(true);
+    auto file = std::unique_ptr<IFile>(f.fs->open(path.c_str(), O_RDONLY));
+    CHECK(file);
+    f.read_all(file.get());
+    CHECK(f.source->reads == 0 && f.source->opens == 0 && f.stats->puts == 0);
+    std::cout << "external pool-seed, public URI, checksum, full blob and tail, cache-only: PASS\n";
 }
 
 int main(int argc, char **argv) {
@@ -659,7 +744,9 @@ int main(int argc, char **argv) {
         return 1;
     int result = 0;
     try {
-        if (argc == 3 && std::string(argv[1]) == "--real-recovery")
+        if (argc == 5 && std::string(argv[1]) == "--real-seeded")
+            real_seeded(argv[2], argv[3], argv[4]);
+        else if (argc == 3 && std::string(argv[1]) == "--real-recovery")
             real_recovery(argv[2]);
         else if (argc == 2 && std::string(argv[1]) == "--real") {
             basic(true);
@@ -675,9 +762,10 @@ int main(int argc, char **argv) {
             scheme();
             batches_and_strict();
             options_validation();
+            large_block_limits();
             independent_blocks();
         } else {
-            throw std::runtime_error("usage: moonpool_test [--real | --real-recovery <directory>]");
+            throw std::runtime_error("usage: moonpool_test [--real | --real-recovery <directory> | --real-seeded <blob> <block-size> <namespace>]");
         }
     } catch (const std::exception &error) {
         std::cerr << "FAIL: " << error.what() << '\n';

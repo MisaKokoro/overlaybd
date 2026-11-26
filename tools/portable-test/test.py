@@ -20,8 +20,8 @@ def options():
         raise RuntimeError('非法或保留网桥名')
     if c['fallback'] not in ['none','direct']:raise RuntimeError('fallback 只能为 none/direct')
     n=c.get('cache_block_size')
-    if type(n) is not int or n<4096 or n>4194304 or n%4096:
-        raise RuntimeError('cache_block_size 必须为 4 KiB～4 MiB 的 4096 整数倍；旧测试目录请重新初始化')
+    if type(n) is not int or n<4096 or n>((2**63-1-4096)//4096)*4096 or n%4096:
+        raise RuntimeError('cache_block_size 必须为不小于 4096 的 4096 整数倍，并为有符号长度保留头部和对齐空间')
     return c
 def env(c):
     e=os.environ.copy(); e['PATH']=str(B/'bin')+':'+os.environ.get('PATH','/usr/sbin:/usr/bin:/sbin:/bin')
@@ -101,7 +101,7 @@ def doctor(c,verbose=True):
         match=re.search(r'libmooncake_store\.so\s+=>\s+(\S+)',p.stdout)
         if not match: raise RuntimeError('未找到系统 Mooncake C SDK')
         symbols=output(['readelf','--dyn-syms','--wide',match[1]])
-        for sym in ['mooncake_store_setup','mooncake_store_put','mooncake_store_batch_get_into']:
+        for sym in ['mooncake_store_setup','mooncake_store_put_from','mooncake_store_batch_get_into']:
             if not any(sym in l and ' UND ' not in l for l in symbols.splitlines()):
                 raise RuntimeError('系统 Mooncake 缺少 C 接口：'+sym)
     print('架构及依赖检查通过；仍需确保系统 Mooncake 与构建所用 C ABI 兼容。')
@@ -312,7 +312,7 @@ def main():
         if not all(1024<=c[k]<=65535 for k in ['registry_port','api_port']) or c['registry_port']==c['api_port']:raise RuntimeError('端口应不同且在1024..65535内')
         if not 1<=c['device_tenant']<=255 or not 1<=c['timeout_ms']<=10000:raise RuntimeError('tenant 或 timeout 超出范围')
         n=c['cache_block_size']
-        if n<4096 or n>4194304 or n%4096:raise RuntimeError('非法 cache-block-size')
+        if n<4096 or n>((2**63-1-4096)//4096)*4096 or n%4096:raise RuntimeError('非法 cache-block-size')
         save(OPTIONS,c);generate(c);print('配置已写入 options.json；下一步 doctor、start。');return
     c=options()
     if a.command in ['verify','verify-missing']:

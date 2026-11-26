@@ -47,9 +47,9 @@ OverlayBD 层读取器 → 本地文件缓存 → PoolFile
 | 配置项 | 含义与约束 |
 | --- | --- |
 | `protocol` | 默认 `tcp`，当前仅支持 TCP。`rdma`、`ub` 明确返回不支持，其他值视为无效配置；不会静默改用 TCP。 |
-| `batchBlocks` | 默认 16，范围 1～64。每次 SDK 批量查询的块数上限；批次数据区上限为 64 MiB，另有每槽最多 4096 字节的头部/对齐开销。 |
+| `batchBlocks` | 默认 16，范围 1～64。每次 SDK 批量查询的块数上限；批次数据区目标为 64 MiB，超过该大小的单个块仍允许读取；另计头部和对齐开销。 |
 | `fallback` | 默认 `direct`：允许回源并尽力回填；`none`：仅本地缓存与 Mooncake，缺块、错误或损坏均失败且不回填。 |
-| `blockSize` | 缓存块大小，单位为字节；必须是 4096 的整数倍，范围为 4096～4194304。 |
+| `blockSize` | 缓存块大小，单位为字节；必须是 4096 的整数倍，不再设置 4 MiB 上限，最小为 4096。 |
 | `timeoutMs` | 单批缓存查询的等待上限，包含排队时间，范围为 1～60000 毫秒；不代表整个镜像读取或源站请求的超时上限。 |
 | `retryMs` | 出错后的重试间隔，单位为毫秒，必须大于 0。 |
 | `queueDepth` | 待处理操作数量上限，范围为 1～256；此外最多还有一个正在执行的操作。 |
@@ -134,7 +134,7 @@ moonpool://v1/t/team-a/sha256:<摘要>?bs=4096&tenant=team-a
 
 `<摘要>` 必须替换为真实的 64 位小写十六进制摘要。路径描述整个 blob，块编号由读取偏移计算。解析器拒绝未知版本、无效摘要、重复或未知参数、缺失参数、非法租户，以及私有层路径与参数中的租户不一致。租户字符约束与命名空间相同，且不能单独为 `.` 或 `..`。
 
-**URI 的 bs 是原始 blob 缓存块大小，与 ZFile 压缩块大小独立。** 范围为 4096～4194304，按 4096 对齐。全局 pool.blockSize 与 snapshotter poolBlockSize 均默认 262144；预热端使用相同大小。具体层始终以 URI 为准，不用全局值重新解释。
+**URI 的 bs 是原始 blob 缓存块大小，与 ZFile 压缩块大小独立。** 不再设置 4 MiB 上限，最小为 4096，按 4096 对齐。全局 pool.blockSize 与 snapshotter poolBlockSize 均默认 262144；预热端使用相同大小。具体层始终以 URI 为准，不用全局值重新解释。
 
 snapshotter 配置示例：
 
@@ -244,10 +244,12 @@ manifest/config 仍由 Docker/containerd 从 Registry 获取；策略只覆盖�
 
 ## 独立缓存块实现与边界
 
-当前按最新协议使用新快照和新预热数据，不提供旧格式迁移兼容验收。不再生成或读取 zfileBlockSize 字段。Key 和 OBDPOOL1 的 64 字节头部格式不变。缓存块配置范围为 4 KiB～4 MiB，与真实 ZFile 压缩参数独立。
+当前按最新协议使用新快照和新预热数据，不提供旧格式迁移兼容验收。不再生成或读取 zfileBlockSize 字段。Key 和 OBDPOOL1 的 64 字节头部格式不变。缓存块配置最小为 4 KiB，不再设置 4 MiB 上限，与真实 ZFile 压缩参数独立。
 
-每个全局配置及层 URI 的 `B * batchBlocks` 不得超过 64 MiB；超出时在初始化或打开层时明确拒绝。注册区由单个原生工作线程按每批实际最大 Value 容量和块数分配/扩容，包含头部及页对齐；总注册区最多 64 MiB 加 256 KiB 对齐开销。容量不依赖全局默认值。分配或注册失败返回资源错误，在 direct 模式下也不回源，避免把配置或资源问题伪装成缓存缺失。超时仍遵循原有策略，异步任务保留自己的数据生命周期。
+读取端不再要求 `B × batchBlocks ≤ 64 MiB`。每批块数为 `min(batchBlocks, max(1, floor(64 MiB / B)))`，且只请求本次读取涉及的块；B 超过 64 MiB 时按单块读取。实际 Value 长度为 64 加 payload 长度，尾块只分配实际长度，注册槽按 4096 对齐。注册区和结果副本均会占用内存，这不是进程总内存上限。分配、注册或长度溢出失败返回资源错误，在 direct 模式下也不回源。URI 的 bs 始终优先于全局默认值，预热端不需要与读取端使用相同的 batch 数量。
 
-单元和真实 C SDK 用例覆盖 4 KiB、256 KiB、4 MiB、全局小块/URI 大块、单槽到批量缓冲扩容、尾块、不对齐 preadv、资源错误禁止回源以及层批量内存预算拒绝。独立测试包 `tools/portable-test` 默认 256 KiB，使用原始无 zfile-config 的 native 镜像验证。
+单元和真实 C SDK 用例覆盖 4 KiB、256 KiB、4 MiB、全局小块/URI 大块、单槽到批量缓冲扩容、尾块、不对齐 preadv、资源错误禁止回源以及大块自动拆批及算术溢出拒绝。独立测试包 `tools/portable-test` 默认 256 KiB，使用原始无 zfile-config 的 native 镜像验证。
 
 本次 Docker 验证使用没有 zfile-config 注解的原始 native 镜像，真实 ZFile 块为 4 KiB，缓存块为 256 KiB；211 块通过 54 次批量读取，最大实际批次 4，层数据零回源，容器文件 SHA256 校验通过。空池 pull 失败且不回源。新测试包支持通过 image/manifest/check-command/expect-output 验收外部预热结果。证据见工作区 `results/cache-block-decoupling.json`。
+
+2026-11-26 扩展验收：已验证 8 MiB、80 MiB 的真实 C SDK 读写及独立 pool-seed → 公共层 PoolFile 的 cache-only 读取；仍保留 4096 字节对齐和整数安全检查。写入使用正式 `mooncake_store_put_from` 与注册缓冲区，避免固定 SDK staging 容量限制。

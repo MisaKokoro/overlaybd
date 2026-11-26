@@ -8,7 +8,7 @@ struct URI {
     std::string digest;
     std::string tenant;
     bool private_layer = false;
-    uint32_t block_size = 0;
+    uint64_t block_size = 0;
     // Internal open context, supplied by ImageFile, never by the layer URI.
     std::string origin;
     uint64_t size = 0;

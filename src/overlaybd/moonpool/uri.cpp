@@ -1,5 +1,6 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "uri.h"
+#include "limits.h"
 #include <cerrno>
 #include <climits>
 #include <map>
@@ -128,7 +129,7 @@ bool parse_uri(const std::string &path, URI &out, bool internal) {
     if (args.size() != (internal ? 4 : 2) || !args.count("bs") || !args.count("tenant"))
         return fail();
     uint64_t bs;
-    if (!number(args["bs"], bs) || bs < 4096 || bs > 4 * 1024 * 1024 || bs % 4096)
+    if (!number(args["bs"], bs) || !valid_block_size(bs))
         return fail();
     result.block_size = bs;
     result.tenant = args["tenant"];

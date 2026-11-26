@@ -1,5 +1,6 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "pool_fs.h"
+#include "limits.h"
 #include <algorithm>
 #include <store_c.h>
 #include <cstring>
@@ -57,14 +58,9 @@ class MooncakeBackend final : public Backend {
     }
 
     bool ensure_buffer(size_t slot_size, size_t count) {
-        // Bound values before additions/multiplications; include header and
-        // page-alignment overhead (at most 4096 bytes per slot).
-        if (!count || count > options_.batch_blocks || slot_size < 64 ||
-            slot_size > 4 * 1024 * 1024 + 64 ||
-            slot_size - 64 > (64 * 1024 * 1024) / count)
+        size_t stride, capacity;
+        if (count > options_.batch_blocks || !buffer_layout(slot_size, count, stride, capacity))
             return false;
-        const size_t stride = (slot_size + 4095) / 4096 * 4096;
-        const size_t capacity = stride * count;
         if (registered_ && capacity <= capacity_) {
             stride_ = stride;
             return true;
@@ -169,7 +165,12 @@ public:
     bool put(const std::string &key, const std::vector<char> &value) override {
         if (!ready())
             return false;
-        auto ret = mooncake_store_put(store_, key.c_str(), value.data(), value.size(), nullptr);
+        if (!ensure_buffer(value.size(), 1))
+            return false;
+        memcpy(buffer_, value.data(), value.size());
+        // put() copies into the SDK's fixed local staging pool. Registered
+        // put_from() also supports objects larger than that pool.
+        auto ret = mooncake_store_put_from(store_, key.c_str(), buffer_, value.size(), nullptr);
         // Immutable content can be inserted concurrently. Existing objects are
         // validated on every read; never remove a shared object to repair it.
         if (ret == 0 || ret == -705)

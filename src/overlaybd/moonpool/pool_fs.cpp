@@ -1,6 +1,9 @@
 /* Copyright The Overlaybd Authors. Licensed under the Apache License, Version 2.0. */
 #include "pool_fs.h"
 #include "uri.h"
+#include "limits.h"
+#include <new>
+#include <stdexcept>
 #include <algorithm>
 #include <cerrno>
 #include <climits>
@@ -100,6 +103,16 @@ class AsyncStore {
                         if (read.result == Result::Error)
                             state->retry_after = milliseconds() + state->options.retry_ms;
                 }
+            } catch (const std::bad_alloc &) {
+                if (job->write)
+                    state->stats->put_errors++;
+                for (auto &read : job->reads)
+                    read.result = Result::ResourceError;
+            } catch (const std::length_error &) {
+                if (job->write)
+                    state->stats->put_errors++;
+                for (auto &read : job->reads)
+                    read.result = Result::ResourceError;
             } catch (...) {
                 if (job->write)
                     state->stats->put_errors++;
@@ -302,7 +315,7 @@ public:
         return -1;
     }
 
-    ssize_t pread(void *buf, size_t count, off_t offset) override {
+    ssize_t pread(void *buf, size_t count, off_t offset) override try {
         if (offset < 0 || count > static_cast<size_t>(SSIZE_MAX)) {
             errno = EINVAL;
             return -1;
@@ -326,7 +339,8 @@ public:
         while (copied < count) {
             const auto first = (static_cast<uint64_t>(offset) + copied) / options_.block_size;
             const auto last = (static_cast<uint64_t>(offset) + count - 1) / options_.block_size;
-            const auto blocks = std::min<uint64_t>(options_.batch_blocks, last - first + 1);
+            const auto blocks = std::min<uint64_t>(
+                read_batch_blocks(options_.block_size, options_.batch_blocks), last - first + 1);
             std::vector<ReadRequest> requests(blocks);
             for (size_t i = 0; i < blocks; ++i) {
                 requests[i].key = prefix_ + std::to_string(first + i);
@@ -390,9 +404,15 @@ public:
             }
         }
         return copied;
+    } catch (const std::bad_alloc &) {
+        errno = ENOMEM;
+        return -1;
+    } catch (const std::length_error &) {
+        errno = EOVERFLOW;
+        return -1;
     }
 
-    ssize_t preadv(const struct iovec *iov, int iovcnt, off_t offset) override {
+    ssize_t preadv(const struct iovec *iov, int iovcnt, off_t offset) override try {
         if (iovcnt < 0 || iovcnt > IOV_MAX || offset < 0 || (iovcnt && !iov)) {
             errno = EINVAL;
             return -1;
@@ -413,7 +433,7 @@ public:
             errno = EINVAL;
             return -1;
         }
-        std::vector<char> buffer(std::min(total, options_.block_size * options_.batch_blocks));
+        std::vector<char> buffer(std::min(total, BATCH_PAYLOAD_TARGET));
         size_t copied = 0, within = 0;
         int index = 0;
         while (copied < total) {
@@ -439,6 +459,12 @@ public:
                 break;
         }
         return copied;
+    } catch (const std::bad_alloc &) {
+        errno = ENOMEM;
+        return -1;
+    } catch (const std::length_error &) {
+        errno = EOVERFLOW;
+        return -1;
     }
 
 };
@@ -472,11 +498,7 @@ public:
             URI uri;
             if (!parse_uri(path, uri, true))
                 return nullptr;
-            // Validate per-layer memory before any origin open or pool access.
-            // The URI is authoritative even when the global default differs.
-            if (uri.block_size > (64 * 1024 * 1024) / options_.batch_blocks) {
-                LOG_ERROR_RETURN(EINVAL, nullptr, "moonpool URI batch exceeds 64 MiB payload budget");
-            }
+            // The URI remains authoritative even when the global default differs.
             auto source = new LazyOrigin(m_fs, uri);
             if (!options_.enable)
                 return source;
@@ -519,16 +541,9 @@ IFileSystem *new_pool_fs(IFileSystem *source, const Options &options,
         (options.fallback != "direct" && options.fallback != "none") ||
         (!options.enable && options.fallback == "none") ||
         options.batch_blocks < 1 || options.batch_blocks > 64 ||
-        options.block_size < 4096 ||
-        options.block_size > 4 * 1024 * 1024 || options.block_size % 4096 || !options.timeout_ms ||
+        !valid_block_size(options.block_size) || !options.timeout_ms ||
         options.timeout_ms > 60000 || !options.retry_ms || !options.queue_depth ||
         options.queue_depth > 256) {
-        errno = EINVAL;
-        return nullptr;
-    }
-    // Bound payload memory while retaining the previously valid 4 MiB block
-    // size with the default batch of 16. Slots also carry a header/alignment.
-    if (options.block_size * options.batch_blocks > 64 * 1024 * 1024) {
         errno = EINVAL;
         return nullptr;
     }

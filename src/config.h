@@ -123,7 +123,7 @@ struct PoolConfig : public ConfigUtils::Config {
     APPCFG_PARA(protocol, std::string, "tcp");
     APPCFG_PARA(batchBlocks, uint32_t, 16);
     APPCFG_PARA(fallback, std::string, "direct");
-    APPCFG_PARA(blockSize, uint32_t, 262144);
+    APPCFG_PARA(blockSize, uint64_t, 262144);
     APPCFG_PARA(timeoutMs, uint32_t, 200);
     APPCFG_PARA(retryMs, uint32_t, 1000);
     APPCFG_PARA(queueDepth, uint32_t, 32);

@@ -262,7 +262,7 @@ int ImageService::read_global_config_and_set() {
             (pool.HasMember("protocol") && !pool["protocol"].IsString()) ||
             (pool.HasMember("fallback") && !pool["fallback"].IsString()) ||
             (pool.HasMember("batchBlocks") && !pool["batchBlocks"].IsUint()) ||
-            (pool.HasMember("blockSize") && !pool["blockSize"].IsUint())) {
+            (pool.HasMember("blockSize") && !pool["blockSize"].IsUint64())) {
             LOG_ERROR_RETURN(EINVAL, -1, "invalid pool protocol/fallback/batchBlocks/blockSize types");
         }
     }
